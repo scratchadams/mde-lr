@@ -1,33 +1,39 @@
+//! CLI entry point for mde-lr — a Microsoft Defender for Endpoint Live Response client.
+//!
+//! Authenticates via OAuth2 client credentials, then dispatches to the
+//! appropriate MDE API action based on CLI flags (`-g` for GetFile, etc.).
+
 use clap::Parser;
 
-use crate::auth::TokenProvider;
-use crate::client::MdeClient;
-use crate::live_response::{
+use mde_lr::auth::TokenProvider;
+use mde_lr::client::MdeClient;
+use mde_lr::live_response::{
     run_live_response, CommandType, Command, LiveResponseRequest, Param,
 };
-
-mod auth;
-mod live_response;
-mod client;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Remote file path (required for GetFile commands).
     #[arg(long)]
     file: Option<std::path::PathBuf>,
 
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
+    /// MDE device ID to target for live response actions.
     #[arg(long)]
     device_id: String,
 
+    /// Azure AD tenant ID for OAuth2 authentication.
     #[arg(long)]
     tenant_id: String,
 
+    /// Azure AD application (client) ID.
     #[arg(long)]
     client_id: String,
 
+    /// Azure AD client secret.
     #[arg(long)]
     secret: String,
 
@@ -38,11 +44,13 @@ struct Cli {
     actions: ActionFlags,
 }
 
+/// Mutually-selectable action flags. Exactly one should be set per invocation.
 #[derive(clap::Args)]
 struct ActionFlags {
     #[arg(short)]
     put: bool,
 
+    /// Collect a file from the remote device via Live Response GetFile.
     #[arg(short)]
     get: bool,
 
