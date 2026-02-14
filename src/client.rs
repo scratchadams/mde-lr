@@ -7,11 +7,11 @@
 //! Token refresh is lazy: the first request that finds no cached token will
 //! trigger `refresh_token()` automatically via `bearer_token()`.
 
-use reqwest::{Method, Client};
-use serde::{Serialize, de::DeserializeOwned};
-use tokio::sync::Mutex;
 use crate::auth::TokenProvider;
+use reqwest::{Client, Method};
+use serde::{Serialize, de::DeserializeOwned};
 use std::error::Error;
+use tokio::sync::Mutex;
 
 const BASE_URL: &str = "https://api.security.microsoft.com/";
 
@@ -34,7 +34,7 @@ impl MdeClient {
         MdeClient {
             client: Client::new(),
             base_url: BASE_URL.to_string(),
-            auth: Mutex::new(auth)
+            auth: Mutex::new(auth),
         }
     }
 
@@ -86,15 +86,18 @@ impl MdeClient {
         Ok(resp.json::<T>().await?)
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Box<dyn Error + Send + Sync>> {
+    pub async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
         self.send_json::<T, ()>(Method::GET, path, None).await
     }
 
     pub async fn post<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,
         path: &str,
-        body: &B
-    ) -> Result <T, Box<dyn Error + Send + Sync>> {
+        body: &B,
+    ) -> Result<T, Box<dyn Error + Send + Sync>> {
         self.send_json(Method::POST, path, Some(body)).await
     }
 

@@ -7,9 +7,7 @@ use clap::Parser;
 
 use mde_lr::auth::TokenProvider;
 use mde_lr::client::MdeClient;
-use mde_lr::live_response::{
-    run_live_response, CommandType, Command, LiveResponseRequest, Param,
-};
+use mde_lr::live_response::{Command, CommandType, LiveResponseRequest, Param, run_live_response};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -78,7 +76,12 @@ async fn main() {
                 command_type: CommandType::GetFile,
                 params: vec![Param {
                     key: "Path".to_string(),
-                    value: args.file.as_ref().expect("--file required for GetFile").to_string_lossy().to_string(),
+                    value: args
+                        .file
+                        .as_ref()
+                        .expect("--file required for GetFile")
+                        .to_string_lossy()
+                        .to_string(),
                 }],
             }],
         };

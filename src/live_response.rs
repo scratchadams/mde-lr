@@ -11,7 +11,7 @@
 //! - `RunScript`: JSON with `script_name`, `exit_code`, `script_output`, `script_errors`.
 //! - `GetFile`: raw file bytes (typically a zip).
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 
 use crate::client::MdeClient;
@@ -104,7 +104,9 @@ pub async fn run_live_response(
         match status.status.as_str() {
             "Succeeded" => break status,
             "Failed" | "Cancelled" => {
-                return Err(format!("Live response action {}: {}", status.status, status.id).into());
+                return Err(
+                    format!("Live response action {}: {}", status.status, status.id).into(),
+                );
             }
             _ => continue, // Pending, InProgress, etc.
         }
@@ -145,9 +147,18 @@ mod tests {
         };
         let json = serde_json::to_value(&req).unwrap();
         // API expects PascalCase keys
-        assert!(json.get("Commands").is_some(), "should serialize as 'Commands'");
-        assert!(json.get("Comment").is_some(), "should serialize as 'Comment'");
-        assert!(json.get("commands").is_none(), "lowercase 'commands' should not appear");
+        assert!(
+            json.get("Commands").is_some(),
+            "should serialize as 'Commands'"
+        );
+        assert!(
+            json.get("Comment").is_some(),
+            "should serialize as 'Comment'"
+        );
+        assert!(
+            json.get("commands").is_none(),
+            "lowercase 'commands' should not appear"
+        );
     }
 
     #[test]
@@ -226,6 +237,9 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: LiveResponseRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.commands.len(), 1);
-        assert_eq!(restored.commands[0].params[0].value, "C:\\Windows\\TEMP\\log.zip");
+        assert_eq!(
+            restored.commands[0].params[0].value,
+            "C:\\Windows\\TEMP\\log.zip"
+        );
     }
 }

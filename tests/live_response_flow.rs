@@ -10,11 +10,11 @@
 //! Blob Storage download (step 4) since all requests route through the
 //! same reqwest client.
 
-use wiremock::{MockServer, Mock, ResponseTemplate};
-use wiremock::matchers::{method, path};
 use mde_lr::auth::TokenProvider;
 use mde_lr::client::MdeClient;
 use mde_lr::live_response::*;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn full_getfile_flow_returns_downloaded_bytes() {
@@ -79,10 +79,16 @@ async fn full_getfile_flow_returns_downloaded_bytes() {
         }],
     };
 
-    let results = run_live_response(&client, machine_id, &request).await.unwrap();
+    let results = run_live_response(&client, machine_id, &request)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 1, "should have one result per command");
-    assert_eq!(results[0].as_ref(), file_content, "downloaded bytes should match");
+    assert_eq!(
+        results[0].as_ref(),
+        file_content,
+        "downloaded bytes should match"
+    );
 }
 
 #[tokio::test]
@@ -141,13 +147,21 @@ async fn runscript_result_can_be_parsed_from_downloaded_bytes() {
         commands: vec![Command {
             command_type: CommandType::RunScript,
             params: vec![
-                Param { key: "ScriptName".to_string(), value: "whoami.ps1".to_string() },
-                Param { key: "Args".to_string(), value: "".to_string() },
+                Param {
+                    key: "ScriptName".to_string(),
+                    value: "whoami.ps1".to_string(),
+                },
+                Param {
+                    key: "Args".to_string(),
+                    value: "".to_string(),
+                },
             ],
         }],
     };
 
-    let results = run_live_response(&client, machine_id, &request).await.unwrap();
+    let results = run_live_response(&client, machine_id, &request)
+        .await
+        .unwrap();
     let parsed: ScriptResult = serde_json::from_slice(&results[0]).unwrap();
 
     assert_eq!(parsed.script_name, "whoami.ps1");
@@ -198,7 +212,10 @@ async fn failed_action_returns_error() {
     assert!(result.is_err(), "should return an error for Failed actions");
 
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("Failed"), "error should mention the failure status");
+    assert!(
+        err_msg.contains("Failed"),
+        "error should mention the failure status"
+    );
 }
 
 #[tokio::test]
@@ -271,7 +288,9 @@ async fn multi_command_returns_result_per_command() {
         ],
     };
 
-    let results = run_live_response(&client, machine_id, &request).await.unwrap();
+    let results = run_live_response(&client, machine_id, &request)
+        .await
+        .unwrap();
 
     assert_eq!(results.len(), 2, "should return one result per command");
     assert_eq!(results[0].as_ref(), b"content-0");

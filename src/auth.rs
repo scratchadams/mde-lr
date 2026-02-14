@@ -5,7 +5,7 @@
 //! can be refreshed on demand. Consumers (e.g. `MdeClient`) read the cached
 //! token via `token()` and call `refresh_token()` when it is absent or stale.
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 
@@ -92,12 +92,7 @@ impl TokenProvider {
 
         let url = TOKEN_URL.replace("{tenant_id}", &self.tenant_id);
 
-        let response = self
-            .client
-            .post(&url)
-            .form(&body)
-            .send()
-            .await?;
+        let response = self.client.post(&url).form(&body).send().await?;
 
         // Read body before checking status so we can surface Microsoft's
         // detailed error (AADSTS codes) on failure.
@@ -112,7 +107,6 @@ impl TokenProvider {
         self.response = Some(resp);
 
         Ok(())
-
     }
 
     pub async fn get(&mut self, path: &str) -> Result<Value, Box<dyn Error + Send + Sync>> {
@@ -134,7 +128,6 @@ impl TokenProvider {
     pub fn token(&self) -> Option<&str> {
         self.response.as_ref().map(|ret| ret.access_token.as_str())
     }
-
 }
 
 #[cfg(test)]
@@ -144,13 +137,19 @@ mod tests {
     #[test]
     fn token_is_none_before_refresh() {
         let tp = TokenProvider::new("tenant", "client", "secret", "scope");
-        assert!(tp.token().is_none(), "token must be None before any refresh");
+        assert!(
+            tp.token().is_none(),
+            "token must be None before any refresh"
+        );
     }
 
     #[test]
     fn token_url_interpolation() {
         let url = TOKEN_URL.replace("{tenant_id}", "abc-123");
-        assert_eq!(url, "https://login.microsoftonline.com/abc-123/oauth2/v2.0/token");
+        assert_eq!(
+            url,
+            "https://login.microsoftonline.com/abc-123/oauth2/v2.0/token"
+        );
     }
 
     #[test]
