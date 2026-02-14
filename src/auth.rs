@@ -6,12 +6,10 @@
 //! token via `token()` and call `refresh_token()` when it is absent or stale.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::error::Error;
 
 /// Azure AD v2.0 token endpoint. `{tenant_id}` is replaced at runtime.
 const TOKEN_URL: &str = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token";
-const BASE_URL: &str = "https://api.security.microsoft.com/";
 
 /// Form body sent to the token endpoint.
 /// Fields are serialized as `application/x-www-form-urlencoded` by reqwest's `.form()`.
@@ -107,20 +105,6 @@ impl TokenProvider {
         self.response = Some(resp);
 
         Ok(())
-    }
-
-    pub async fn get(&mut self, path: &str) -> Result<Value, Box<dyn Error + Send + Sync>> {
-        let url = format!("{}{}", BASE_URL, path);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.response.as_mut().unwrap().access_token)
-            .send()
-            .await?
-            .json()
-            .await?;
-
-        Ok(resp)
     }
 
     /// Returns the cached access token, or `None` if `refresh_token()` has
