@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Azure AD v2.0 token endpoint. `{tenant_id}` is replaced at runtime.
 const TOKEN_URL: &str = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token";
@@ -36,6 +36,30 @@ pub struct TokenResponse {
 /// the token actually expires. Prevents requests from racing the expiry boundary.
 const EXPIRY_BUFFER_SECS: u64 = 60;
 
+/// Connect timeout for the token endpoint HTTP client.
+/// This only covers TCP + TLS handshake, not the full request.
+/// Azure AD typically responds in <500ms; 10s is generous to cover
+/// cold-start or network-congested environments.
+const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Overall request timeout for token endpoint calls.
+/// Covers the entire round-trip: connect + send + server processing + response.
+/// Token requests are small payloads so 30s is more than sufficient.
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Builds a `reqwest::Client` with explicit timeouts for token endpoint calls.
+///
+/// Using `Client::new()` relies on reqwest's defaults (no connect timeout,
+/// 30s overall), which can leave the process hanging on DNS or connection
+/// issues. Explicit timeouts make failure modes predictable.
+fn build_token_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(TOKEN_CONNECT_TIMEOUT)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
+        .build()
+        .expect("failed to build HTTP client for token endpoint")
+}
+
 /// Manages OAuth2 token acquisition and caching.
 ///
 /// Invariants:
@@ -57,7 +81,7 @@ pub struct TokenProvider {
 impl TokenProvider {
     pub fn new(tenant_id: &str, client_id: &str, client_secret: &str, scope: &str) -> Self {
         TokenProvider {
-            client: reqwest::Client::new(),
+            client: build_token_client(),
             scope: scope.to_string(),
             tenant_id: tenant_id.to_string(),
             client_id: client_id.to_string(),
@@ -72,7 +96,7 @@ impl TokenProvider {
     /// The token is treated as freshly acquired (expires_in = 3600s).
     pub fn with_token(token: &str) -> Self {
         TokenProvider {
-            client: reqwest::Client::new(),
+            client: build_token_client(),
             scope: String::new(),
             tenant_id: String::new(),
             client_id: String::new(),
@@ -109,7 +133,7 @@ impl TokenProvider {
         let body = response.text().await?;
 
         if !status.is_success() {
-            return Err(format!("Token request failed ({}): {}", status, body).into());
+            return Err(format!("Token request failed ({status}): {body}").into());
         }
 
         let resp: TokenResponse = serde_json::from_str(&body)?;
@@ -138,6 +162,16 @@ impl TokenProvider {
             return None;
         }
         self.response.as_ref().map(|ret| ret.access_token.as_str())
+    }
+
+    /// Discards the cached token so the next call to `token()` returns `None`.
+    ///
+    /// This is used by `MdeClient` to force a re-authentication when the API
+    /// returns 401 Unauthorized — indicating the token was revoked or expired
+    /// server-side before our local expiry tracking detected it.
+    pub fn invalidate(&mut self) {
+        self.response = None;
+        self.acquired_at = None;
     }
 }
 
@@ -219,10 +253,7 @@ mod tests {
         // far enough back that expires_in - buffer has elapsed.
         let mut tp = TokenProvider::with_token("test-token");
         tp.acquired_at = Some(Instant::now() - std::time::Duration::from_secs(7200));
-        assert!(
-            tp.token().is_none(),
-            "token must be None after expiry"
-        );
+        assert!(tp.token().is_none(), "token must be None after expiry");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! The Live Response API is a 4-step async flow:
 //! 1. POST `/api/machines/{id}/runliveresponse` — starts the action (returns `Pending`).
-//! 2. Poll `GET /api/machineactions/{id}` — wait until status is `Succeeded`.
+//! 2. Poll `GET /api/machineactions/{id}` — wait until status reaches a terminal state.
 //! 3. GET `.../GetLiveResponseResultDownloadLink(index=N)` — get a time-limited Azure SAS URL.
 //! 4. Download from the SAS URL — raw bytes (no bearer auth; SAS token is in the query string).
 //!
@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::time::{Duration, Instant};
 
 use crate::client::MdeClient;
 
@@ -51,12 +52,34 @@ pub struct Param {
 
 // ── Response types ─────────────────────────────────────────────────────
 
+/// The lifecycle status of an MDE machine action.
+///
+/// Actions transition through these states:
+///   Pending → InProgress → Succeeded | Failed | Cancelled
+///
+/// `Unknown` is a catch-all for any status string the API returns that we
+/// don't recognize. This prevents deserialization failures if Microsoft
+/// adds new status values in the future. During polling, `Unknown` is
+/// treated the same as `Pending` — the loop continues waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionStatus {
+    Pending,
+    InProgress,
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// Catch-all for unrecognized status strings from the API.
+    /// Treated as non-terminal during polling (the loop continues).
+    #[serde(other)]
+    Unknown,
+}
+
 /// Represents the action status returned by POST (creation) and GET (polling).
 /// The `status` field transitions through: Pending → InProgress → Succeeded | Failed | Cancelled.
 #[derive(Debug, Deserialize)]
 pub struct MachineAction {
     pub id: String,
-    pub status: String,
+    pub status: ActionStatus,
 }
 
 /// Wrapper for the download-link endpoint response.
@@ -76,6 +99,49 @@ pub struct ScriptResult {
     pub script_errors: String,
 }
 
+// ── Polling configuration ──────────────────────────────────────────────
+
+/// Controls the polling behavior when waiting for a live response action
+/// to reach a terminal state (Succeeded, Failed, or Cancelled).
+///
+/// Defaults:
+/// - `interval`: 5 seconds between polls. This balances responsiveness
+///   against API rate limits. MDE actions typically take 10-60 seconds.
+/// - `timeout`: 10 minutes. Covers long-running script executions and
+///   large file collections. Prevents infinite hangs if a device goes
+///   offline mid-action.
+///
+/// To customize, construct directly or use `PollConfig::new()`:
+/// ```ignore
+/// let config = PollConfig {
+///     interval: Duration::from_secs(10),
+///     timeout: Duration::from_secs(300),
+/// };
+/// ```
+#[derive(Clone)]
+pub struct PollConfig {
+    /// How long to wait between consecutive poll requests.
+    pub interval: Duration,
+    /// Maximum total time to spend polling before returning a timeout error.
+    /// Measured from the start of the first poll, not from action creation.
+    pub timeout: Duration,
+}
+
+impl PollConfig {
+    pub fn new(interval: Duration, timeout: Duration) -> Self {
+        PollConfig { interval, timeout }
+    }
+}
+
+impl Default for PollConfig {
+    fn default() -> Self {
+        PollConfig {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(600), // 10 minutes
+        }
+    }
+}
+
 // ── Orchestration ──────────────────────────────────────────────────────
 
 /// Runs a live response session end-to-end and returns the raw downloaded
@@ -85,39 +151,65 @@ pub struct ScriptResult {
 /// - For `RunScript`, deserialize as `ScriptResult`.
 /// - For `GetFile`, the bytes are the file content (often a zip).
 ///
-/// Polling uses a fixed 5-second interval. The loop runs indefinitely until
-/// the action reaches a terminal state (`Succeeded`, `Failed`, `Cancelled`).
+/// Polling behavior is controlled by `poll_config`. Pass `None` to use
+/// defaults (5s interval, 10min timeout). See `PollConfig` for details.
+///
+/// Error conditions:
+/// - Network or authentication failures at any step.
+/// - The action reaches `Failed` or `Cancelled` status.
+/// - Polling exceeds the configured timeout without reaching a terminal state.
 pub async fn run_live_response(
     client: &MdeClient,
     machine_id: &str,
     request: &LiveResponseRequest,
+    poll_config: Option<&PollConfig>,
 ) -> Result<Vec<bytes::Bytes>, Box<dyn Error + Send + Sync>> {
+    let config = poll_config.cloned().unwrap_or_default();
+
     // Step 1: Start the live response action.
-    let path = format!("api/machines/{}/runliveresponse", machine_id);
+    let path = format!("api/machines/{machine_id}/runliveresponse");
     let action: MachineAction = client.post(&path, request).await?;
 
-    // Step 2: Poll until the action reaches a terminal state.
+    // Step 2: Poll until the action reaches a terminal state or we time out.
     let poll_path = format!("api/machineactions/{}", action.id);
+    let started = Instant::now();
     let completed = loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(config.interval).await;
+
+        // Check timeout before making the next poll request, so we don't
+        // send a request we already know we can't afford to wait for.
+        if started.elapsed() > config.timeout {
+            return Err(format!(
+                "Polling timed out after {:?} for action {}",
+                config.timeout, action.id
+            )
+            .into());
+        }
+
         let status: MachineAction = client.get(&poll_path).await?;
-        match status.status.as_str() {
-            "Succeeded" => break status,
-            "Failed" | "Cancelled" => {
+        match status.status {
+            // Terminal success — proceed to download.
+            ActionStatus::Succeeded => break status,
+            // Terminal failure — report and stop.
+            ActionStatus::Failed | ActionStatus::Cancelled => {
                 return Err(
-                    format!("Live response action {}: {}", status.status, status.id).into(),
+                    format!("Live response action {:?}: {}", status.status, status.id).into(),
                 );
             }
-            _ => continue, // Pending, InProgress, etc.
+            // Non-terminal — keep polling. This includes Pending, InProgress,
+            // and Unknown (future API status values we don't recognize yet).
+            ActionStatus::Pending | ActionStatus::InProgress | ActionStatus::Unknown => continue,
         }
     };
 
     // Steps 3 & 4: For each command, get the download link then fetch the bytes.
+    // The MDE API returns one download link per command, indexed in the same
+    // order as the commands in the original request.
     let mut results = Vec::new();
     for (i, _cmd) in request.commands.iter().enumerate() {
         let link_path = format!(
-            "api/machineactions/{}/GetLiveResponseResultDownloadLink(index={})",
-            completed.id, i
+            "api/machineactions/{}/GetLiveResponseResultDownloadLink(index={i})",
+            completed.id
         );
         let link: DownloadLink = client.get(&link_path).await?;
         let data = client.download(&link.value).await?;
@@ -170,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_action_deserializes_from_api_response() {
+    fn machine_action_deserializes_known_status() {
         let json = r#"{
             "id": "abc-123",
             "type": "LiveResponse",
@@ -180,7 +272,35 @@ mod tests {
         }"#;
         let action: MachineAction = serde_json::from_str(json).unwrap();
         assert_eq!(action.id, "abc-123");
-        assert_eq!(action.status, "Pending");
+        assert_eq!(action.status, ActionStatus::Pending);
+    }
+
+    #[test]
+    fn machine_action_deserializes_unknown_status_gracefully() {
+        // If Microsoft adds a new status value, we should not panic or fail
+        // deserialization — it maps to ActionStatus::Unknown instead.
+        let json = r#"{
+            "id": "abc-456",
+            "status": "SomeNewStatus"
+        }"#;
+        let action: MachineAction = serde_json::from_str(json).unwrap();
+        assert_eq!(action.status, ActionStatus::Unknown);
+    }
+
+    #[test]
+    fn action_status_round_trips_through_serde() {
+        // Verify all known variants survive serialize → deserialize.
+        for status in [
+            ActionStatus::Pending,
+            ActionStatus::InProgress,
+            ActionStatus::Succeeded,
+            ActionStatus::Failed,
+            ActionStatus::Cancelled,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let restored: ActionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored, status, "round-trip failed for {json}");
+        }
     }
 
     #[test]
@@ -241,5 +361,14 @@ mod tests {
             restored.commands[0].params[0].value,
             "C:\\Windows\\TEMP\\log.zip"
         );
+    }
+
+    // ── PollConfig tests ──────────────────────────────────────────────
+
+    #[test]
+    fn poll_config_default_has_sane_values() {
+        let config = PollConfig::default();
+        assert_eq!(config.interval, Duration::from_secs(5));
+        assert_eq!(config.timeout, Duration::from_secs(600));
     }
 }

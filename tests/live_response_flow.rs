@@ -28,7 +28,7 @@ async fn full_getfile_flow_returns_downloaded_bytes() {
 
     // Step 1: POST runliveresponse → Pending action
     Mock::given(method("POST"))
-        .and(path(format!("api/machines/{}/runliveresponse", machine_id)))
+        .and(path(format!("api/machines/{machine_id}/runliveresponse")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Pending"
@@ -40,7 +40,7 @@ async fn full_getfile_flow_returns_downloaded_bytes() {
     // In a real scenario this would transition through Pending → InProgress → Succeeded.
     // We return Succeeded immediately to keep the test fast.
     Mock::given(method("GET"))
-        .and(path(format!("api/machineactions/{}", action_id)))
+        .and(path(format!("api/machineactions/{action_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Succeeded"
@@ -52,8 +52,7 @@ async fn full_getfile_flow_returns_downloaded_bytes() {
     let download_url = format!("{}/blob/result.zip", server.uri());
     Mock::given(method("GET"))
         .and(path(format!(
-            "api/machineactions/{}/GetLiveResponseResultDownloadLink(index=0)",
-            action_id
+            "api/machineactions/{action_id}/GetLiveResponseResultDownloadLink(index=0)"
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "value": download_url
@@ -79,7 +78,7 @@ async fn full_getfile_flow_returns_downloaded_bytes() {
         }],
     };
 
-    let results = run_live_response(&client, machine_id, &request)
+    let results = run_live_response(&client, machine_id, &request, None)
         .await
         .unwrap();
 
@@ -107,7 +106,7 @@ async fn runscript_result_can_be_parsed_from_downloaded_bytes() {
     });
 
     Mock::given(method("POST"))
-        .and(path(format!("api/machines/{}/runliveresponse", machine_id)))
+        .and(path(format!("api/machines/{machine_id}/runliveresponse")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Pending"
@@ -116,7 +115,7 @@ async fn runscript_result_can_be_parsed_from_downloaded_bytes() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("api/machineactions/{}", action_id)))
+        .and(path(format!("api/machineactions/{action_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Succeeded"
@@ -127,8 +126,7 @@ async fn runscript_result_can_be_parsed_from_downloaded_bytes() {
     let download_url = format!("{}/blob/script_result.json", server.uri());
     Mock::given(method("GET"))
         .and(path(format!(
-            "api/machineactions/{}/GetLiveResponseResultDownloadLink(index=0)",
-            action_id
+            "api/machineactions/{action_id}/GetLiveResponseResultDownloadLink(index=0)"
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "value": download_url
@@ -159,7 +157,7 @@ async fn runscript_result_can_be_parsed_from_downloaded_bytes() {
         }],
     };
 
-    let results = run_live_response(&client, machine_id, &request)
+    let results = run_live_response(&client, machine_id, &request, None)
         .await
         .unwrap();
     let parsed: ScriptResult = serde_json::from_slice(&results[0]).unwrap();
@@ -179,7 +177,7 @@ async fn failed_action_returns_error() {
     let machine_id = "device-down";
 
     Mock::given(method("POST"))
-        .and(path(format!("api/machines/{}/runliveresponse", machine_id)))
+        .and(path(format!("api/machines/{machine_id}/runliveresponse")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Pending"
@@ -189,7 +187,7 @@ async fn failed_action_returns_error() {
 
     // Polling returns Failed
     Mock::given(method("GET"))
-        .and(path(format!("api/machineactions/{}", action_id)))
+        .and(path(format!("api/machineactions/{action_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Failed"
@@ -208,7 +206,7 @@ async fn failed_action_returns_error() {
         }],
     };
 
-    let result = run_live_response(&client, machine_id, &request).await;
+    let result = run_live_response(&client, machine_id, &request, None).await;
     assert!(result.is_err(), "should return an error for Failed actions");
 
     let err_msg = result.unwrap_err().to_string();
@@ -228,7 +226,7 @@ async fn multi_command_returns_result_per_command() {
     let machine_id = "device-multi";
 
     Mock::given(method("POST"))
-        .and(path(format!("api/machines/{}/runliveresponse", machine_id)))
+        .and(path(format!("api/machines/{machine_id}/runliveresponse")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Pending"
@@ -237,7 +235,7 @@ async fn multi_command_returns_result_per_command() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path(format!("api/machineactions/{}", action_id)))
+        .and(path(format!("api/machineactions/{action_id}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": action_id,
             "status": "Succeeded"
@@ -250,8 +248,7 @@ async fn multi_command_returns_result_per_command() {
         let dl_url = format!("{}/blob/result_{}.bin", server.uri(), i);
         Mock::given(method("GET"))
             .and(path(format!(
-                "api/machineactions/{}/GetLiveResponseResultDownloadLink(index={})",
-                action_id, i
+                "api/machineactions/{action_id}/GetLiveResponseResultDownloadLink(index={i})"
             )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "value": dl_url
@@ -260,9 +257,9 @@ async fn multi_command_returns_result_per_command() {
             .await;
 
         Mock::given(method("GET"))
-            .and(path(format!("/blob/result_{}.bin", i)))
+            .and(path(format!("/blob/result_{i}.bin")))
             .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(format!("content-{}", i).into_bytes()),
+                ResponseTemplate::new(200).set_body_bytes(format!("content-{i}").into_bytes()),
             )
             .mount(&server)
             .await;
@@ -288,7 +285,7 @@ async fn multi_command_returns_result_per_command() {
         ],
     };
 
-    let results = run_live_response(&client, machine_id, &request)
+    let results = run_live_response(&client, machine_id, &request, None)
         .await
         .unwrap();
 

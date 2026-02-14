@@ -2,6 +2,13 @@
 //!
 //! Authenticates via OAuth2 client credentials, then dispatches to the
 //! appropriate MDE API action based on CLI flags (`-g` for GetFile, etc.).
+//!
+//! Exit codes:
+//! - 0: success
+//! - 1: runtime error (auth failure, API error, timeout, etc.)
+//! - 2: argument validation error (clap handles this automatically)
+
+use std::process::ExitCode;
 
 use clap::Parser;
 
@@ -31,8 +38,10 @@ struct Cli {
     #[arg(long)]
     client_id: String,
 
-    /// Azure AD client secret.
-    #[arg(long)]
+    /// Azure AD client secret. Prefer setting via the MDE_CLIENT_SECRET
+    /// environment variable to avoid exposing the secret in process listings
+    /// and shell history.
+    #[arg(long, env = "MDE_CLIENT_SECRET")]
     secret: String,
 
     #[arg(long)]
@@ -42,8 +51,13 @@ struct Cli {
     actions: ActionFlags,
 }
 
-/// Mutually-selectable action flags. Exactly one should be set per invocation.
+/// Action flags — exactly one must be set per invocation.
+///
+/// Clap enforces this at parse time via the `group` attribute:
+/// - If none are set, clap prints an error and exits with code 2.
+/// - If more than one is set, clap prints an error and exits with code 2.
 #[derive(clap::Args)]
+#[group(required = true, multiple = false)]
 struct ActionFlags {
     #[arg(short)]
     put: bool,
@@ -57,7 +71,7 @@ struct ActionFlags {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = Cli::parse();
 
     println!("DeviceID: {}", args.device_id);
@@ -70,29 +84,40 @@ async fn main() {
     let client = MdeClient::new(tp).await;
 
     if args.actions.get {
+        // Validate that --file is provided. This is a semantic requirement
+        // (GetFile needs a path), not something clap can enforce via groups
+        // because --file is shared across action types.
+        let file_path = match &args.file {
+            Some(path) => path.to_string_lossy().to_string(),
+            None => {
+                eprintln!("Error: --file is required when using -g (GetFile)");
+                return ExitCode::FAILURE;
+            }
+        };
+
         let request = LiveResponseRequest {
             comment: "Live response via mde-lr CLI".to_string(),
             commands: vec![Command {
                 command_type: CommandType::GetFile,
                 params: vec![Param {
                     key: "Path".to_string(),
-                    value: args
-                        .file
-                        .as_ref()
-                        .expect("--file required for GetFile")
-                        .to_string_lossy()
-                        .to_string(),
+                    value: file_path,
                 }],
             }],
         };
 
-        match run_live_response(&client, &args.device_id, &request).await {
+        match run_live_response(&client, &args.device_id, &request, None).await {
             Ok(results) => {
                 for (i, data) in results.iter().enumerate() {
-                    println!("Command {} result: {} bytes", i, data.len());
+                    println!("Command {i} result: {} bytes", data.len());
                 }
             }
-            Err(e) => eprintln!("Error: {}", e),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     }
+
+    ExitCode::SUCCESS
 }
