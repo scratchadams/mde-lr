@@ -12,10 +12,10 @@
 //! - `GetFile`: raw file bytes (typically a zip).
 
 use serde::{Deserialize, Serialize};
-use std::error::Error;
 use std::time::{Duration, Instant};
 
 use crate::client::MdeClient;
+use crate::error::MdeError;
 
 // ── Request types ──────────────────────────────────────────────────────
 
@@ -23,8 +23,10 @@ use crate::client::MdeClient;
 /// Field names are PascalCase to match the MDE API contract.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LiveResponseRequest {
+    /// The commands to execute on the remote device, in order.
     #[serde(rename = "Commands")]
     pub commands: Vec<Command>,
+    /// Free-text comment attached to the action for audit purposes.
     #[serde(rename = "Comment")]
     pub comment: String,
 }
@@ -33,20 +35,33 @@ pub struct LiveResponseRequest {
 /// Commands execute in order; if one fails, subsequent commands are skipped.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Command {
+    /// The type of command to execute (`RunScript` or `GetFile`).
     #[serde(rename = "type")]
     pub command_type: CommandType,
+    /// Key-value parameters for the command (e.g. `Path`, `ScriptName`).
     pub params: Vec<Param>,
 }
 
+/// The type of Live Response command to execute on the remote device.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CommandType {
+    /// Execute a PowerShell script on the device and return its output.
     RunScript,
+    /// Collect a file from the device and return its contents.
     GetFile,
 }
 
+/// A key-value parameter for a Live Response command.
+///
+/// Common keys include:
+/// - `"Path"` — remote file path (for `GetFile`)
+/// - `"ScriptName"` — script to execute (for `RunScript`)
+/// - `"Args"` — arguments to pass to the script
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Param {
+    /// The parameter name (e.g. `"Path"`, `"ScriptName"`).
     pub key: String,
+    /// The parameter value (e.g. a file path or script name).
     pub value: String,
 }
 
@@ -63,10 +78,15 @@ pub struct Param {
 /// treated the same as `Pending` — the loop continues waiting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionStatus {
+    /// The action has been created but not yet picked up by the device.
     Pending,
+    /// The device is actively executing the action.
     InProgress,
+    /// The action completed successfully; results are available for download.
     Succeeded,
+    /// The action failed (e.g. script error, device-side issue).
     Failed,
+    /// The action was cancelled before completion.
     Cancelled,
     /// Catch-all for unrecognized status strings from the API.
     /// Treated as non-terminal during polling (the loop continues).
@@ -76,26 +96,37 @@ pub enum ActionStatus {
 
 /// Represents the action status returned by POST (creation) and GET (polling).
 /// The `status` field transitions through: Pending → InProgress → Succeeded | Failed | Cancelled.
+///
+/// This is `pub(crate)` because it is an internal wire type used by
+/// `run_live_response` — callers receive the final `Vec<Bytes>` result,
+/// not intermediate polling states.
 #[derive(Debug, Deserialize)]
-pub struct MachineAction {
-    pub id: String,
-    pub status: ActionStatus,
+pub(crate) struct MachineAction {
+    pub(crate) id: String,
+    pub(crate) status: ActionStatus,
 }
 
 /// Wrapper for the download-link endpoint response.
 /// `value` is a time-limited (30 min) Azure Blob Storage SAS URL.
+///
+/// This is `pub(crate)` — callers of `run_live_response` receive the
+/// downloaded bytes directly and never see the intermediate SAS URL.
 #[derive(Debug, Deserialize)]
-pub struct DownloadLink {
-    pub value: String,
+pub(crate) struct DownloadLink {
+    pub(crate) value: String,
 }
 
 /// Parsed output from a RunScript command download.
 /// The downloaded bytes are JSON in this shape.
 #[derive(Debug, Deserialize)]
 pub struct ScriptResult {
+    /// The name of the script that was executed.
     pub script_name: String,
+    /// The process exit code (0 = success, non-zero = error).
     pub exit_code: i32,
+    /// The script's stdout output.
     pub script_output: String,
+    /// The script's stderr output (empty string on success).
     pub script_errors: String,
 }
 
@@ -128,6 +159,7 @@ pub struct PollConfig {
 }
 
 impl PollConfig {
+    /// Creates a new `PollConfig` with the specified interval and timeout.
     pub fn new(interval: Duration, timeout: Duration) -> Self {
         PollConfig { interval, timeout }
     }
@@ -154,16 +186,18 @@ impl Default for PollConfig {
 /// Polling behavior is controlled by `poll_config`. Pass `None` to use
 /// defaults (5s interval, 10min timeout). See `PollConfig` for details.
 ///
-/// Error conditions:
-/// - Network or authentication failures at any step.
-/// - The action reaches `Failed` or `Cancelled` status.
-/// - Polling exceeds the configured timeout without reaching a terminal state.
+/// Error variants returned:
+/// - `MdeError::Auth` — token acquisition or refresh failed.
+/// - `MdeError::Api` — MDE API returned a non-success HTTP status (with body preserved).
+/// - `MdeError::Timeout` — polling exceeded the configured timeout.
+/// - `MdeError::ActionFailed` — action reached `Failed` or `Cancelled` status.
+/// - `MdeError::Network` — transport-level failure (DNS, TCP, TLS).
 pub async fn run_live_response(
     client: &MdeClient,
     machine_id: &str,
     request: &LiveResponseRequest,
     poll_config: Option<&PollConfig>,
-) -> Result<Vec<bytes::Bytes>, Box<dyn Error + Send + Sync>> {
+) -> crate::error::Result<Vec<bytes::Bytes>> {
     let config = poll_config.cloned().unwrap_or_default();
 
     // Step 1: Start the live response action.
@@ -179,11 +213,10 @@ pub async fn run_live_response(
         // Check timeout before making the next poll request, so we don't
         // send a request we already know we can't afford to wait for.
         if started.elapsed() > config.timeout {
-            return Err(format!(
-                "Polling timed out after {:?} for action {}",
-                config.timeout, action.id
-            )
-            .into());
+            return Err(MdeError::Timeout {
+                elapsed: started.elapsed(),
+                action_id: action.id.clone(),
+            });
         }
 
         let status: MachineAction = client.get(&poll_path).await?;
@@ -192,9 +225,10 @@ pub async fn run_live_response(
             ActionStatus::Succeeded => break status,
             // Terminal failure — report and stop.
             ActionStatus::Failed | ActionStatus::Cancelled => {
-                return Err(
-                    format!("Live response action {:?}: {}", status.status, status.id).into(),
-                );
+                return Err(MdeError::ActionFailed {
+                    status: format!("{:?}", status.status),
+                    action_id: status.id,
+                });
             }
             // Non-terminal — keep polling. This includes Pending, InProgress,
             // and Unknown (future API status values we don't recognize yet).

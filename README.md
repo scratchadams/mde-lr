@@ -15,7 +15,7 @@ The CLI handles token acquisition, token refresh, bounded polling with timeout, 
 
 ## Prerequisites
 
-- **Rust nightly toolchain** — the project uses `edition = "2024"`, which requires nightly. The channel is pinned in `rust-toolchain.toml`, so `rustup` will select it automatically.
+- **Rust 1.85 or later** — the project uses `edition = "2024"`, which stabilized in Rust 1.85. The stable channel is pinned in `rust-toolchain.toml`, so `rustup` will select it automatically.
 - **Azure AD app registration** with the following:
   - `WindowsDefenderATP` API permissions for Live Response (application-level, admin-consented).
   - A client secret (or access to one via environment variable).
@@ -70,12 +70,10 @@ The `--secret` flag reads from `MDE_CLIENT_SECRET` automatically when not provid
 | `--tenant-id` | Yes | Azure AD tenant ID for OAuth2 |
 | `--client-id` | Yes | Azure AD application (client) ID |
 | `--secret` | Yes | Client secret (or set `MDE_CLIENT_SECRET` env var) |
-| `-g` | One of `-g`, `-p`, `-d` | GetFile action — collect a file from the remote device |
-| `-p` | One of `-g`, `-p`, `-d` | Put action (not yet implemented) |
-| `-d` | One of `-g`, `-p`, `-d` | Download action (not yet implemented) |
+| `-g` | Yes | GetFile action — collect a file from the remote device |
 | `--file` | When using `-g` | Remote file path to collect |
 
-Exactly one action flag (`-g`, `-p`, or `-d`) must be provided per invocation. The CLI enforces this at parse time.
+Currently only `-g` (GetFile) is implemented. Additional action flags will be added when PutFile and RunScript CLI paths are ready.
 
 ### Exit Codes
 
@@ -89,10 +87,11 @@ Exactly one action flag (`-g`, `-p`, or `-d`) must be provided per invocation. T
 
 ```
 src/
-  lib.rs              # Crate root — re-exports auth, client, live_response
-  main.rs             # CLI entry point (clap-derived argument parsing)
+  lib.rs              # Crate root — re-exports modules, #![warn(missing_docs)]
+  main.rs             # CLI entry point (clap-derived args, exit codes)
   auth.rs             # OAuth2 TokenProvider — token acquisition, caching, expiry
   client.rs           # MdeClient — authenticated HTTP wrapper with 401 retry
+  error.rs            # MdeError — typed error hierarchy (thiserror)
   live_response.rs    # Live Response models + 4-step orchestration
 tests/
   live_response_flow.rs  # Integration tests using wiremock mock server
@@ -100,11 +99,13 @@ tests/
 
 ## Architecture
 
-The crate is organized into three modules with clear responsibilities:
+The crate is organized into four modules with clear responsibilities:
 
 **`auth`** — Manages the OAuth2 client credentials flow against Azure AD's `/oauth2/v2.0/token` endpoint. Caches the token and tracks its expiry with a 60-second safety buffer. Callers never need to explicitly "log in" — the first API request triggers token acquisition automatically.
 
 **`client`** — Wraps `reqwest::Client` with bearer-token authentication and a one-shot 401 retry mechanism. If the MDE API returns `401 Unauthorized`, the client invalidates the cached token, acquires a fresh one from Azure AD, and retries exactly once. A second 401 is treated as a hard failure. The token is stored behind a `tokio::sync::Mutex` so `&self` methods can refresh it without requiring `&mut self`.
+
+**`error`** — Typed error hierarchy (`MdeError`) with variants for each failure boundary: `Auth`, `Api` (preserves response body), `Timeout`, `ActionFailed`, `Parse`, and `Network`. Replaces the previous `Box<dyn Error>` convention with structured errors that enable callers to match on failure categories and inspect the full cause chain via `source()`.
 
 **`live_response`** — Contains the request/response types for the MDE Live Response API and the `run_live_response()` orchestration function. Polling is bounded by a configurable timeout (default 10 minutes) and interval (default 5 seconds). The `ActionStatus` enum uses `#[serde(other)]` for forward compatibility with new API status values.
 
@@ -127,6 +128,7 @@ For a detailed architecture document covering state diagrams, failure semantics,
 ```rust
 use mde_lr::auth::TokenProvider;
 use mde_lr::client::MdeClient;
+use mde_lr::error::MdeError;
 use mde_lr::live_response::{
     Command, CommandType, LiveResponseRequest, Param,
     PollConfig, ScriptResult, run_live_response,
@@ -134,15 +136,15 @@ use mde_lr::live_response::{
 use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Authenticate
+async fn main() -> Result<(), MdeError> {
+    // Authenticate (commercial cloud — pass None for default base URL)
     let tp = TokenProvider::new(
         "your-tenant-id",
         "your-client-id",
         "your-client-secret",
         "https://api.securitycenter.microsoft.com/.default",
     );
-    let client = MdeClient::new(tp).await;
+    let client = MdeClient::new(tp, None).await;
 
     // Build a GetFile request
     let request = LiveResponseRequest {
@@ -210,7 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 # Build
 cargo build
 
-# Run all tests (19 unit + 4 integration)
+# Run all tests (27 unit + 4 integration)
 cargo test
 
 # Run a specific test
@@ -241,6 +243,7 @@ All four steps of the live response flow execute without any real network calls.
 | `reqwest` (json, form) | Async HTTP client for API and token requests |
 | `serde` / `serde_json` | JSON serialization with PascalCase field renaming |
 | `serde_urlencoded` | Form-encoded serialization for OAuth2 token requests |
+| `thiserror` | Typed error derivation with source chaining |
 | `tokio` (full) | Async runtime |
 | `bytes` | Zero-copy byte buffer for download results |
 | `wiremock` (dev) | HTTP mock server for integration tests |
@@ -257,17 +260,23 @@ The project follows a phased plan. Phase 1 (production correctness) is complete:
 - [x] CLI exit codes and argument validation
 - [x] Client secret via environment variable
 
+Phase 2 (library hardening) is complete:
+
+- [x] Typed `MdeError` enum with thiserror (preserves API error bodies)
+- [x] Configurable cloud endpoints (sovereign/government clouds)
+- [x] Public API surface audit and `#![warn(missing_docs)]`
+- [x] Stable toolchain migration (edition 2024 on Rust 1.85+)
+- [x] Crate metadata (description, keywords, license)
+
 Planned next:
 
-- [ ] Typed error enum replacing `Box<dyn Error>` — preserves API error bodies
-- [ ] Configurable cloud endpoints (sovereign/government clouds)
-- [ ] Public API surface audit and `#![warn(missing_docs)]`
 - [ ] CI workflow (fmt, clippy, test, doc)
 - [ ] Integration tests for 401 retry and polling timeout paths
-- [ ] `-p` (put) and `-d` (download) action implementations
+- [ ] PutFile and RunScript CLI action implementations
+- [ ] Structured logging/tracing
 
 See [architecture.md](architecture.md) for detailed design documentation including state diagrams, sequence diagrams, and decision records.
 
 ## License
 
-TBD
+MIT

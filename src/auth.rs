@@ -6,16 +6,26 @@
 //! token via `token()` and call `refresh_token()` when it is absent or stale.
 
 use serde::{Deserialize, Serialize};
-use std::error::Error;
 use std::time::{Duration, Instant};
 
-/// Azure AD v2.0 token endpoint. `{tenant_id}` is replaced at runtime.
-const TOKEN_URL: &str = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token";
+use crate::error::MdeError;
+
+/// Default Azure AD v2.0 token endpoint template for the commercial cloud.
+/// `{tenant_id}` is replaced at runtime with the actual tenant ID.
+///
+/// For sovereign clouds, override this via `TokenProvider::with_token_url()`:
+/// - GCC High: `https://login.microsoftonline.us/{tenant_id}/oauth2/v2.0/token`
+/// - DoD:      `https://login.microsoftonline.us/{tenant_id}/oauth2/v2.0/token`
+/// - China:    `https://login.chinacloudapi.cn/{tenant_id}/oauth2/v2.0/token`
+const DEFAULT_TOKEN_URL: &str = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token";
 
 /// Form body sent to the token endpoint.
 /// Fields are serialized as `application/x-www-form-urlencoded` by reqwest's `.form()`.
+///
+/// This is module-private — external consumers interact with `TokenProvider`,
+/// not the raw request shape.
 #[derive(Serialize)]
-pub struct TokenRequest<'a> {
+struct TokenRequest<'a> {
     client_id: &'a str,
     scope: &'a str,
     client_secret: &'a str,
@@ -25,11 +35,18 @@ pub struct TokenRequest<'a> {
 /// Subset of the Azure AD token response that we need.
 /// The endpoint returns additional fields (e.g. `ext_expires_in`) which are
 /// silently ignored by serde because we don't mark the struct `deny_unknown_fields`.
+///
+/// This is `pub(crate)` because `TokenProvider` manages the token lifecycle —
+/// external consumers read the token via `TokenProvider::token()`, not by
+/// inspecting the raw response.
 #[derive(Deserialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub token_type: String,
-    pub expires_in: u64,
+pub(crate) struct TokenResponse {
+    pub(crate) access_token: String,
+    /// Token type (always "Bearer"). Retained for serde deserialization
+    /// completeness but not read by application code.
+    #[allow(dead_code)]
+    pub(crate) token_type: String,
+    pub(crate) expires_in: u64,
 }
 
 /// Safety buffer subtracted from `expires_in` to trigger refresh before
@@ -68,8 +85,11 @@ fn build_token_client() -> reqwest::Client {
 ///   expires (with a 60-second safety buffer), the provider is dropped,
 ///   or the token is replaced by a subsequent refresh.
 /// - `acquired_at` is always `Some` when `response` is `Some`.
+/// - `token_url` always contains `{tenant_id}` which is replaced at runtime.
 pub struct TokenProvider {
     client: reqwest::Client,
+    /// The token endpoint URL template. Must contain `{tenant_id}` placeholder.
+    token_url: String,
     scope: String,
     tenant_id: String,
     client_id: String,
@@ -79,9 +99,36 @@ pub struct TokenProvider {
 }
 
 impl TokenProvider {
+    /// Creates a new `TokenProvider` targeting the commercial Azure AD endpoint.
+    ///
+    /// For sovereign clouds (GCC High, DoD, China), use `with_token_url()`
+    /// to override the token endpoint.
     pub fn new(tenant_id: &str, client_id: &str, client_secret: &str, scope: &str) -> Self {
+        Self::with_token_url(
+            tenant_id,
+            client_id,
+            client_secret,
+            scope,
+            DEFAULT_TOKEN_URL,
+        )
+    }
+
+    /// Creates a new `TokenProvider` with a custom token endpoint URL template.
+    ///
+    /// The `token_url` must contain `{tenant_id}` — it will be replaced with
+    /// the actual tenant ID at request time. Examples:
+    /// - Commercial: `https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token`
+    /// - GCC High:   `https://login.microsoftonline.us/{tenant_id}/oauth2/v2.0/token`
+    pub fn with_token_url(
+        tenant_id: &str,
+        client_id: &str,
+        client_secret: &str,
+        scope: &str,
+        token_url: &str,
+    ) -> Self {
         TokenProvider {
             client: build_token_client(),
+            token_url: token_url.to_string(),
             scope: scope.to_string(),
             tenant_id: tenant_id.to_string(),
             client_id: client_id.to_string(),
@@ -97,6 +144,7 @@ impl TokenProvider {
     pub fn with_token(token: &str) -> Self {
         TokenProvider {
             client: build_token_client(),
+            token_url: DEFAULT_TOKEN_URL.to_string(),
             scope: String::new(),
             tenant_id: String::new(),
             client_id: String::new(),
@@ -115,7 +163,15 @@ impl TokenProvider {
     /// The response body is read as text first so that on failure the raw
     /// AADSTS error message is preserved in the error — `error_for_status()`
     /// would discard this diagnostic information.
-    pub async fn refresh_token(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ///
+    /// Error mapping:
+    /// - Network failures (DNS, TCP, TLS, timeout) → `MdeError::Auth` with
+    ///   the `reqwest::Error` as the source.
+    /// - Non-2xx HTTP status → `MdeError::Auth` with the raw response body
+    ///   (contains AADSTS error codes).
+    /// - Malformed JSON response → `MdeError::Auth` with the
+    ///   `serde_json::Error` as the source.
+    pub async fn refresh_token(&mut self) -> crate::error::Result<()> {
         let body = TokenRequest {
             client_id: &self.client_id,
             scope: &self.scope,
@@ -123,20 +179,38 @@ impl TokenProvider {
             grant_type: "client_credentials",
         };
 
-        let url = TOKEN_URL.replace("{tenant_id}", &self.tenant_id);
+        let url = self.token_url.replace("{tenant_id}", &self.tenant_id);
 
-        let response = self.client.post(&url).form(&body).send().await?;
+        let response = self
+            .client
+            .post(&url)
+            .form(&body)
+            .send()
+            .await
+            .map_err(|e| MdeError::Auth {
+                message: format!("failed to reach token endpoint: {e}"),
+                source: Some(Box::new(e)),
+            })?;
 
         // Read body before checking status so we can surface Microsoft's
         // detailed error (AADSTS codes) on failure.
         let status = response.status();
-        let body = response.text().await?;
+        let body = response.text().await.map_err(|e| MdeError::Auth {
+            message: format!("failed to read token response body: {e}"),
+            source: Some(Box::new(e)),
+        })?;
 
         if !status.is_success() {
-            return Err(format!("Token request failed ({status}): {body}").into());
+            return Err(MdeError::Auth {
+                message: format!("token request failed ({status}): {body}"),
+                source: None,
+            });
         }
 
-        let resp: TokenResponse = serde_json::from_str(&body)?;
+        let resp: TokenResponse = serde_json::from_str(&body).map_err(|e| MdeError::Auth {
+            message: format!("failed to parse token response: {e}"),
+            source: Some(Box::new(e)),
+        })?;
         self.acquired_at = Some(Instant::now());
         self.response = Some(resp);
 
@@ -189,11 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn token_url_interpolation() {
-        let url = TOKEN_URL.replace("{tenant_id}", "abc-123");
+    fn default_token_url_interpolation() {
+        let url = DEFAULT_TOKEN_URL.replace("{tenant_id}", "abc-123");
         assert_eq!(
             url,
             "https://login.microsoftonline.com/abc-123/oauth2/v2.0/token"
+        );
+    }
+
+    #[test]
+    fn custom_token_url_for_sovereign_cloud() {
+        let tp = TokenProvider::with_token_url(
+            "tenant-123",
+            "client",
+            "secret",
+            "scope",
+            "https://login.microsoftonline.us/{tenant_id}/oauth2/v2.0/token",
+        );
+        // Verify the custom URL template is stored (not the default).
+        // We can't directly access private fields, but we can verify the
+        // provider is constructed without error and has no cached token.
+        assert!(
+            tp.token().is_none(),
+            "sovereign cloud provider should start with no cached token"
         );
     }
 

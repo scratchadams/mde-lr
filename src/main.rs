@@ -56,18 +56,15 @@ struct Cli {
 /// Clap enforces this at parse time via the `group` attribute:
 /// - If none are set, clap prints an error and exits with code 2.
 /// - If more than one is set, clap prints an error and exits with code 2.
+///
+/// Currently only `-g` (GetFile) is implemented. Additional actions
+/// (PutFile, RunScript) will be added as flags here when ready.
 #[derive(clap::Args)]
 #[group(required = true, multiple = false)]
 struct ActionFlags {
-    #[arg(short)]
-    put: bool,
-
     /// Collect a file from the remote device via Live Response GetFile.
     #[arg(short)]
     get: bool,
-
-    #[arg(short)]
-    download: bool,
 }
 
 #[tokio::main]
@@ -81,7 +78,7 @@ async fn main() -> ExitCode {
         &args.secret,
         "https://api.securitycenter.microsoft.com/.default",
     );
-    let client = MdeClient::new(tp).await;
+    let client = MdeClient::new(tp, None).await;
 
     if args.actions.get {
         // Validate that --file is provided. This is a semantic requirement

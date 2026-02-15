@@ -15,9 +15,10 @@ today is `GetFile`; the core orchestration is generic enough to support
 `RunScript` and multi-command sessions.
 
 **Toolchain requirement:** The project uses `edition = "2024"` (set in
-`Cargo.toml`) and requires a **nightly Rust toolchain**. The pinned channel is
-specified in `rust-toolchain.toml`. Ensure `rustup` is installed and the nightly
-toolchain is active before building.
+`Cargo.toml`) which requires **Rust 1.85 or later**. The stable channel is
+pinned in `rust-toolchain.toml` and the MSRV is declared via `rust-version` in
+`Cargo.toml`. Ensure `rustup` is installed and it will select the correct
+toolchain automatically.
 
 ## 2. System Context
 
@@ -327,8 +328,6 @@ error. This provides forward compatibility if Microsoft adds new status values.
 | `--device-id`, `--tenant-id`, `--client-id` | Required identity fields | Required for execution |
 | `--secret` / `MDE_CLIENT_SECRET` env var | Client secret for OAuth2 | Required; prefer env var to avoid process-list exposure |
 | `-g` + `--file` | GetFile action | Implemented end-to-end; `--file` is validated at runtime when `-g` is set |
-| `-p` | Put action flag | Parsed and validated by clap group constraint, but **no execution path** — silently succeeds with exit code 0 |
-| `-d` | Download action flag | Parsed and validated by clap group constraint, but **no execution path** — silently succeeds with exit code 0 |
 | `--config`, `--query` | Future placeholders | Parsed but currently unused |
 
 **Exit codes:**
@@ -457,7 +456,7 @@ in-process HTTP server, with no network calls to real Azure services.
 
 | Gap | Impact | Suggested direction | Plan phase |
 |---|---|---|---|
-| `-p` and `-d` flags have no execution path | CLI accepts flags that silently do nothing | Either implement handlers or remove flags until ready | — |
+| Only `-g` (GetFile) action implemented | CLI supports one action type | Add `-p` (PutFile) and RunScript flags when execution paths are ready | — |
 | No structured logging/tracing | Harder production debugging of polling and retries | Add `tracing` spans around auth, poll loop, and downloads | — |
 | Boxed dynamic errors everywhere | Coarse error taxonomy for callers; response bodies lost on non-401 errors | Introduce typed `MdeError` enum with source chaining | Phase 2a |
 | Results are fully buffered in memory | Large downloads increase memory pressure | Add optional streaming write-to-disk path | — |

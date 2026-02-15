@@ -16,13 +16,21 @@
 //!   hard failure — no infinite retry loop.
 
 use crate::auth::TokenProvider;
+use crate::error::MdeError;
 use reqwest::{Client, Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
-use std::error::Error;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-const BASE_URL: &str = "https://api.security.microsoft.com/";
+/// Default MDE API base URL for the commercial cloud.
+///
+/// For sovereign clouds, pass a custom base URL to `MdeClient::new()`:
+/// - GCC High:   `https://api-gcc.security.microsoft.us/`
+/// - DoD:        `https://api-gov.security.microsoft.us/`
+/// - China:      `https://api.security.microsoft.cn/`
+///
+/// The URL must end with a trailing slash — API paths are appended directly.
+const DEFAULT_BASE_URL: &str = "https://api.security.microsoft.com/";
 
 /// Connect timeout for the MDE API HTTP client.
 /// Covers TCP + TLS handshake only. 10 seconds is generous for Azure services.
@@ -63,16 +71,29 @@ pub struct MdeClient {
 }
 
 impl MdeClient {
-    pub async fn new(auth: TokenProvider) -> Self {
+    /// Creates a new `MdeClient` targeting the specified API base URL.
+    ///
+    /// For the commercial cloud, pass `None` to use the default
+    /// (`https://api.security.microsoft.com/`). For sovereign clouds,
+    /// pass the cloud-specific base URL (must end with a trailing slash):
+    /// - GCC High: `Some("https://api-gcc.security.microsoft.us/")`
+    /// - DoD:      `Some("https://api-gov.security.microsoft.us/")`
+    ///
+    /// See `TokenProvider::with_token_url()` for the corresponding token
+    /// endpoint overrides — both must target the same cloud environment.
+    pub async fn new(auth: TokenProvider, base_url: Option<&str>) -> Self {
         MdeClient {
             client: build_api_client(),
-            base_url: BASE_URL.to_string(),
+            base_url: base_url.unwrap_or(DEFAULT_BASE_URL).to_string(),
             auth: Mutex::new(auth),
         }
     }
 
     /// Constructor that accepts a custom base URL, used by tests to point
     /// at a local mock server instead of the real MDE API.
+    ///
+    /// This is separate from `new()` to keep test intent explicit — callers
+    /// in production code should use `new()` with an optional base URL.
     pub async fn with_base_url(auth: TokenProvider, base_url: &str) -> Self {
         MdeClient {
             client: build_api_client(),
@@ -86,7 +107,7 @@ impl MdeClient {
     ///
     /// The mutex is held only for the token check and optional refresh.
     /// If refresh itself fails, the error propagates to the caller.
-    async fn bearer_token(&self) -> Result<String, Box<dyn Error + Send + Sync>> {
+    async fn bearer_token(&self) -> crate::error::Result<String> {
         let mut auth = self.auth.lock().await;
         if auth.token().is_none() {
             auth.refresh_token().await?;
@@ -94,7 +115,10 @@ impl MdeClient {
 
         auth.token()
             .map(str::to_owned)
-            .ok_or_else(|| "token missing after refresh".into())
+            .ok_or_else(|| MdeError::Auth {
+                message: "token missing after refresh".to_string(),
+                source: None,
+            })
     }
 
     /// Invalidates the current token and acquires a fresh one from Azure AD.
@@ -102,14 +126,17 @@ impl MdeClient {
     /// Called when the API returns 401, indicating the token was rejected
     /// server-side (revocation, clock skew, etc.) before our local expiry
     /// tracking detected it.
-    async fn force_refresh(&self) -> Result<String, Box<dyn Error + Send + Sync>> {
+    async fn force_refresh(&self) -> crate::error::Result<String> {
         let mut auth = self.auth.lock().await;
         auth.invalidate();
         auth.refresh_token().await?;
 
         auth.token()
             .map(str::to_owned)
-            .ok_or_else(|| "token missing after forced refresh".into())
+            .ok_or_else(|| MdeError::Auth {
+                message: "token missing after forced refresh".to_string(),
+                source: None,
+            })
     }
 
     /// Core HTTP method: sends an authenticated JSON request and deserializes
@@ -123,15 +150,16 @@ impl MdeClient {
     /// - If the response is `401 Unauthorized`, the client assumes the token
     ///   was rejected server-side. It invalidates the cached token, acquires
     ///   a fresh one, and retries the request exactly once.
-    /// - If the retry also returns 401, the error propagates to the caller.
+    /// - If the retry also returns a non-success status, the error propagates
+    ///   to the caller as `MdeError::Api` (preserving the response body).
     /// - Non-401 error status codes (403, 404, 500, etc.) are never retried
-    ///   and propagate immediately via `error_for_status()`.
+    ///   and propagate immediately as `MdeError::Api`.
     async fn send_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
         body: Option<&B>,
-    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+    ) -> crate::error::Result<T> {
         let url = format!("{}{}", self.base_url, path);
 
         // First attempt with current (possibly cached) token.
@@ -139,7 +167,8 @@ impl MdeClient {
         let resp = self
             .build_request(method.clone(), &url, &token, body)
             .send()
-            .await?;
+            .await
+            .map_err(MdeError::Network)?;
 
         // On 401, force a token refresh and retry exactly once.
         // Any other status (success or non-401 error) skips the retry path.
@@ -148,13 +177,32 @@ impl MdeClient {
             let retry_resp = self
                 .build_request(method, &url, &fresh_token, body)
                 .send()
-                .await?
-                .error_for_status()?;
-            return Ok(retry_resp.json::<T>().await?);
+                .await
+                .map_err(MdeError::Network)?;
+
+            return self.parse_response(retry_resp).await;
         }
 
-        let resp = resp.error_for_status()?;
-        Ok(resp.json::<T>().await?)
+        self.parse_response(resp).await
+    }
+
+    /// Checks the HTTP status code and deserializes the JSON response body.
+    ///
+    /// On non-success status codes, reads the full response body text and
+    /// returns `MdeError::Api` with both the status and body preserved.
+    /// This fixes the previous limitation where `error_for_status()` discarded
+    /// the response body — MDE error responses contain diagnostic codes and
+    /// human-readable explanations that are essential for debugging.
+    async fn parse_response<T: DeserializeOwned>(
+        &self,
+        resp: reqwest::Response,
+    ) -> crate::error::Result<T> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MdeError::Api { status, body });
+        }
+        resp.json::<T>().await.map_err(MdeError::Network)
     }
 
     /// Constructs an authenticated request builder with optional JSON body.
@@ -176,10 +224,7 @@ impl MdeClient {
     }
 
     /// Sends an authenticated GET request and deserializes the JSON response.
-    pub async fn get<T: DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> crate::error::Result<T> {
         self.send_json::<T, ()>(Method::GET, path, None).await
     }
 
@@ -189,7 +234,7 @@ impl MdeClient {
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+    ) -> crate::error::Result<T> {
         self.send_json(Method::POST, path, Some(body)).await
     }
 
@@ -199,7 +244,7 @@ impl MdeClient {
         &self,
         path: &str,
         body: &B,
-    ) -> Result<T, Box<dyn Error + Send + Sync>> {
+    ) -> crate::error::Result<T> {
         self.send_json(Method::PUT, path, Some(body)).await
     }
 
@@ -212,8 +257,24 @@ impl MdeClient {
     ///
     /// Note: SAS URLs are not subject to 401 retry logic because they don't
     /// use bearer tokens — authentication is embedded in the URL itself.
-    pub async fn download(&self, url: &str) -> Result<bytes::Bytes, Box<dyn Error + Send + Sync>> {
-        let resp = self.client.get(url).send().await?.error_for_status()?;
-        Ok(resp.bytes().await?)
+    ///
+    /// Error mapping:
+    /// - Network failures → `MdeError::Network`
+    /// - Non-2xx status → `MdeError::Api` with the status and response body
+    pub async fn download(&self, url: &str) -> crate::error::Result<bytes::Bytes> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(MdeError::Network)?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MdeError::Api { status, body });
+        }
+
+        resp.bytes().await.map_err(MdeError::Network)
     }
 }
