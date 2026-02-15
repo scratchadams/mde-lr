@@ -118,3 +118,71 @@ async fn main() -> ExitCode {
 
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Base arguments that satisfy all mandatory fields.
+    /// Tests append or omit flags from this baseline.
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "mde-lr",
+            "--device-id",
+            "dev-123",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+        ]
+    }
+
+    #[test]
+    fn missing_action_flag_is_rejected() {
+        // Clap's `group(required = true)` on ActionFlags should reject
+        // a command line with no action flag. This prevents silent no-ops
+        // where the CLI appears to succeed but does nothing.
+        let args = base_args();
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when no action flag is provided"
+        );
+    }
+
+    #[test]
+    fn getfile_without_file_flag_parses_successfully() {
+        // Clap treats --file as optional (it's `Option<PathBuf>`), so
+        // parsing succeeds. The semantic check (--file required for -g)
+        // happens at runtime in main(), not at parse time. This test
+        // documents that separation of concerns.
+        let mut args = base_args();
+        args.push("-g");
+        let cli = Cli::try_parse_from(args).expect("should parse with -g but no --file");
+        assert!(cli.actions.get, "get flag should be set");
+        assert!(
+            cli.file.is_none(),
+            "--file should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn valid_getfile_args_parse_with_all_fields() {
+        // Full valid invocation: all mandatory args + action flag + --file.
+        // Verifies that clap populates every field correctly.
+        let mut args = base_args();
+        args.extend_from_slice(&["-g", "--file", "/tmp/evidence.zip"]);
+        let cli = Cli::try_parse_from(args).expect("should parse a complete valid command");
+        assert_eq!(cli.device_id, "dev-123");
+        assert_eq!(cli.tenant_id, "tid-456");
+        assert_eq!(cli.client_id, "cid-789");
+        assert_eq!(cli.secret, "s3cret");
+        assert!(cli.actions.get);
+        assert_eq!(
+            cli.file.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/evidence.zip"
+        );
+    }
+}

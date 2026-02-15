@@ -278,3 +278,242 @@ impl MdeClient {
         resp.bytes().await.map_err(MdeError::Network)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::TokenProvider;
+    use serde::Deserialize;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Minimal deserializable struct for testing JSON round-trip through
+    /// `send_json` and `parse_response`. Keeps tests decoupled from the
+    /// real MDE API model types.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TestPayload {
+        value: String,
+    }
+
+    /// Helper: creates a wiremock MockServer and an MdeClient pointed at it.
+    /// Uses `TokenProvider::with_token()` to bypass Azure AD entirely.
+    /// Suitable for tests that don't trigger token refresh (no 401 retry).
+    async fn test_client() -> (MockServer, MdeClient) {
+        let server = MockServer::start().await;
+        let tp = TokenProvider::with_token("test-bearer-token");
+        let client = MdeClient::with_base_url(tp, &format!("{}/", server.uri())).await;
+        (server, client)
+    }
+
+    /// Helper: creates a MockServer and MdeClient where the token endpoint
+    /// also points at the mock server. Required for tests that trigger
+    /// `force_refresh()` (401 retry), because invalidate() clears the cached
+    /// token and `refresh_token()` must hit a reachable endpoint.
+    async fn test_client_with_token_endpoint() -> (MockServer, MdeClient) {
+        let server = MockServer::start().await;
+        let token_url = format!("{}/{{tenant_id}}/oauth2/v2.0/token", server.uri());
+        let tp = TokenProvider::with_token_url(
+            "test-tenant",
+            "test-client",
+            "test-secret",
+            "https://api.securitycenter.microsoft.com/.default",
+            &token_url,
+        );
+        // Pre-populate the token so the first request doesn't need a refresh.
+        // We do this by mounting a token endpoint mock that will be used by
+        // force_refresh() when a 401 triggers re-authentication.
+        let client = MdeClient::with_base_url(tp, &format!("{}/", server.uri())).await;
+        (server, client)
+    }
+
+    /// Mounts a mock token endpoint that returns a valid access token.
+    /// Used by tests that exercise the 401 retry path.
+    async fn mount_token_endpoint(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/test-tenant/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "refreshed-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .named("token endpoint")
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn bearer_token_returns_preloaded_token() {
+        // TokenProvider::with_token() pre-populates the cache, so
+        // bearer_token() should return it without any network call.
+        let (_server, client) = test_client().await;
+        let token = client.bearer_token().await.unwrap();
+        assert_eq!(
+            token, "test-bearer-token",
+            "bearer_token() should return the pre-loaded token from with_token()"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_returns_deserialized_json_on_success() {
+        // Validates the happy path: GET → 200 JSON → deserialized struct.
+        let (server, client) = test_client().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/test"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"value": "hello"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result: TestPayload = client.get("api/test").await.unwrap();
+        assert_eq!(result.value, "hello");
+    }
+
+    #[tokio::test]
+    async fn send_json_retries_once_on_401_then_succeeds() {
+        // The first API request returns 401 (simulating a server-side token
+        // revocation). The client should invalidate the cached token, call
+        // refresh_token() against the token endpoint, and retry the API
+        // request exactly once with the fresh token.
+        let (server, client) = test_client_with_token_endpoint().await;
+
+        // The initial bearer_token() call finds no cached token, so it
+        // hits the token endpoint first. Mount it before anything else.
+        mount_token_endpoint(&server).await;
+
+        // First API request returns 401 (only matches once).
+        Mock::given(method("GET"))
+            .and(path("/api/protected"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("401 first attempt")
+            .mount(&server)
+            .await;
+
+        // Second API request (the retry) returns 200.
+        Mock::given(method("GET"))
+            .and(path("/api/protected"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"value": "retry-ok"})),
+            )
+            .expect(1)
+            .named("200 retry attempt")
+            .mount(&server)
+            .await;
+
+        let result: TestPayload = client.get("api/protected").await.unwrap();
+        assert_eq!(
+            result.value, "retry-ok",
+            "should return the response from the retry attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_json_returns_api_error_after_double_401() {
+        // Both API attempts return 401 — the client must not retry infinitely.
+        // After the second 401, it should return MdeError::Api with the
+        // response body preserved.
+        let (server, client) = test_client_with_token_endpoint().await;
+
+        // Token endpoint for both the initial acquisition and the
+        // force_refresh() triggered by the first 401.
+        mount_token_endpoint(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/always-401"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token permanently revoked"))
+            .expect(2)
+            .named("persistent 401")
+            .mount(&server)
+            .await;
+
+        let result: crate::error::Result<TestPayload> = client.get("api/always-401").await;
+        let err = result.unwrap_err();
+
+        match &err {
+            MdeError::Api { status, body } => {
+                assert_eq!(*status, StatusCode::UNAUTHORIZED);
+                assert!(
+                    body.contains("permanently revoked"),
+                    "error body should be preserved from the second 401 response"
+                );
+            }
+            other => panic!("expected MdeError::Api, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_response_preserves_error_body_on_403() {
+        // Non-401 errors should propagate immediately (no retry) with the
+        // response body preserved for diagnostic purposes.
+        let (server, client) = test_client().await;
+
+        let error_body = r#"{"error":{"code":"Forbidden","message":"Insufficient permissions"}}"#;
+        Mock::given(method("GET"))
+            .and(path("/api/forbidden"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(error_body))
+            .expect(1)
+            .named("403 forbidden")
+            .mount(&server)
+            .await;
+
+        let result: crate::error::Result<TestPayload> = client.get("api/forbidden").await;
+        let err = result.unwrap_err();
+
+        match &err {
+            MdeError::Api { status, body } => {
+                assert_eq!(*status, StatusCode::FORBIDDEN);
+                assert!(
+                    body.contains("Insufficient permissions"),
+                    "MDE error body must be preserved for debugging"
+                );
+            }
+            other => panic!("expected MdeError::Api, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_returns_raw_bytes_without_bearer_auth() {
+        // Validates that download() fetches raw bytes from a SAS URL.
+        // SAS URLs carry auth in the query string — download() uses a plain
+        // GET without the Bearer header that send_json() attaches. We verify
+        // correctness (right bytes returned) and also inspect the recorded
+        // request to confirm no Authorization header was sent.
+        let (server, client) = test_client().await;
+        let expected_bytes = b"raw-file-content";
+
+        Mock::given(method("GET"))
+            .and(path("/blob/file.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(expected_bytes.as_slice()))
+            .expect(1)
+            .named("SAS download")
+            .mount(&server)
+            .await;
+
+        let bytes = client
+            .download(&format!("{}/blob/file.zip", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            expected_bytes,
+            "download() should return raw bytes from the SAS URL"
+        );
+
+        // Inspect the recorded request to verify no bearer token was sent.
+        // This is the key behavioral contract: SAS URLs must not receive
+        // our API bearer token (it would leak credentials to Azure Blob Storage).
+        let requests = server.received_requests().await.unwrap();
+        let download_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/blob/file.zip")
+            .expect("should have received the download request");
+        assert!(
+            !download_req.headers.contains_key("Authorization"),
+            "download() must not send an Authorization header to SAS URLs"
+        );
+    }
+}

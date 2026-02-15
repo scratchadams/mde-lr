@@ -60,7 +60,7 @@ Key design decisions:
 
 ## Testing
 
-- **Unit tests** are embedded in each module (`auth.rs`, `error.rs`, `live_response.rs`)
+- **Unit tests** are embedded in each module (`auth.rs`, `client.rs`, `error.rs`, `live_response.rs`, `main.rs`)
 - **Integration tests** in `tests/` use `wiremock` to mock both MDE API and SAS download endpoints
 - Test helpers: `TokenProvider::with_token()` bypasses Azure AD, `MdeClient::with_base_url()` redirects to mock server
 
@@ -76,3 +76,11 @@ Key design decisions:
 | `tokio` (full) | Async runtime |
 | `bytes` | Byte buffer handling |
 | `wiremock` (dev) | HTTP mocking for tests |
+
+## PR Checklist
+
+Per PR or phase update, require:
+- Short "Why" statement (2-3 sentences explaining the motivation)
+- Tests added for new behavior
+- Any public API changes documented
+- Explicit failure-path notes when control-flow types change (`ActionStatus`, `MdeError`)

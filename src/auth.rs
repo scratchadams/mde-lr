@@ -373,4 +373,20 @@ mod tests {
             "token must still be valid before buffer boundary"
         );
     }
+
+    #[test]
+    fn invalidate_clears_cached_token() {
+        // Validates the cache-clearing mechanism that MdeClient::force_refresh()
+        // relies on to discard a rejected token before re-acquiring a new one.
+        let mut tp = TokenProvider::with_token("test-token");
+        assert!(
+            tp.token().is_some(),
+            "pre-condition: token must exist before invalidation"
+        );
+        tp.invalidate();
+        assert!(
+            tp.token().is_none(),
+            "invalidate() must clear the cached token so the next call triggers a refresh"
+        );
+    }
 }
