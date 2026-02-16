@@ -14,14 +14,27 @@ use clap::Parser;
 
 use mde_lr::auth::TokenProvider;
 use mde_lr::client::MdeClient;
-use mde_lr::live_response::{Command, CommandType, LiveResponseRequest, Param, run_live_response};
+use mde_lr::live_response::{
+    Command, CommandType, LiveResponseRequest, Param, ScriptResult, run_live_response,
+};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// Remote file path (required for GetFile commands).
+    /// Remote file path (required for GetFile and PutFile commands).
     #[arg(long)]
     file: Option<std::path::PathBuf>,
+
+    /// Script name to execute on the remote device (required for RunScript).
+    /// The script must already exist in the MDE Live Response library.
+    #[arg(long)]
+    script: Option<String>,
+
+    /// Arguments to pass to the script (optional, used with RunScript).
+    /// Allows values starting with hyphens (e.g. "-Verbose") since
+    /// PowerShell parameters commonly use that syntax.
+    #[arg(long, allow_hyphen_values = true)]
+    args: Option<String>,
 
     #[arg(long)]
     config: Option<std::path::PathBuf>,
@@ -56,15 +69,22 @@ struct Cli {
 /// Clap enforces this at parse time via the `group` attribute:
 /// - If none are set, clap prints an error and exits with code 2.
 /// - If more than one is set, clap prints an error and exits with code 2.
-///
-/// Currently only `-g` (GetFile) is implemented. Additional actions
-/// (PutFile, RunScript) will be added as flags here when ready.
 #[derive(clap::Args)]
 #[group(required = true, multiple = false)]
 struct ActionFlags {
     /// Collect a file from the remote device via Live Response GetFile.
     #[arg(short)]
     get: bool,
+
+    /// Execute a PowerShell script on the remote device via Live Response RunScript.
+    /// Requires --script (and optionally --args).
+    #[arg(short)]
+    run: bool,
+
+    /// Upload a file from the MDE library to the remote device via Live Response PutFile.
+    /// Requires --file.
+    #[arg(short)]
+    put: bool,
 }
 
 #[tokio::main]
@@ -80,10 +100,12 @@ async fn main() -> ExitCode {
     );
     let client = MdeClient::new(tp, None).await;
 
-    if args.actions.get {
-        // Validate that --file is provided. This is a semantic requirement
-        // (GetFile needs a path), not something clap can enforce via groups
-        // because --file is shared across action types.
+    // Build the LiveResponseRequest based on the selected action flag.
+    // Each action has its own parameter validation: GetFile and PutFile
+    // require --file, RunScript requires --script. These are semantic
+    // requirements that clap can't enforce via groups because the flags
+    // are shared across action types.
+    let request = if args.actions.get {
         let file_path = match &args.file {
             Some(path) => path.to_string_lossy().to_string(),
             None => {
@@ -92,7 +114,7 @@ async fn main() -> ExitCode {
             }
         };
 
-        let request = LiveResponseRequest {
+        LiveResponseRequest {
             comment: "Live response via mde-lr CLI".to_string(),
             commands: vec![Command {
                 command_type: CommandType::GetFile,
@@ -101,18 +123,99 @@ async fn main() -> ExitCode {
                     value: file_path,
                 }],
             }],
+        }
+    } else if args.actions.run {
+        let script_name = match &args.script {
+            Some(name) => name.clone(),
+            None => {
+                eprintln!("Error: --script is required when using -r (RunScript)");
+                return ExitCode::FAILURE;
+            }
         };
 
-        match run_live_response(&client, &args.device_id, &request, None).await {
-            Ok(results) => {
-                for (i, data) in results.iter().enumerate() {
+        let mut params = vec![Param {
+            key: "ScriptName".to_string(),
+            value: script_name,
+        }];
+
+        // Script arguments are optional — many scripts run without parameters.
+        if let Some(script_args) = &args.args {
+            params.push(Param {
+                key: "Args".to_string(),
+                value: script_args.clone(),
+            });
+        }
+
+        LiveResponseRequest {
+            comment: "Live response via mde-lr CLI".to_string(),
+            commands: vec![Command {
+                command_type: CommandType::RunScript,
+                params,
+            }],
+        }
+    } else if args.actions.put {
+        let file_path = match &args.file {
+            Some(path) => path.to_string_lossy().to_string(),
+            None => {
+                eprintln!("Error: --file is required when using -p (PutFile)");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        LiveResponseRequest {
+            comment: "Live response via mde-lr CLI".to_string(),
+            commands: vec![Command {
+                command_type: CommandType::PutFile,
+                params: vec![Param {
+                    key: "Path".to_string(),
+                    value: file_path,
+                }],
+            }],
+        }
+    } else {
+        // This branch is unreachable because clap enforces exactly one
+        // action flag via the group constraint, but we handle it explicitly
+        // to avoid silently succeeding with no action.
+        eprintln!("Error: no action flag provided");
+        return ExitCode::FAILURE;
+    };
+
+    match run_live_response(&client, &args.device_id, &request, None).await {
+        Ok(results) => {
+            for (i, data) in results.iter().enumerate() {
+                // For RunScript results, parse and display the structured output
+                // (exit code, stdout, stderr) rather than just the byte count.
+                // GetFile and PutFile results are opaque binary data where the
+                // byte count is the most useful summary.
+                if args.actions.run {
+                    match serde_json::from_slice::<ScriptResult>(data) {
+                        Ok(script_result) => {
+                            println!(
+                                "Command {i}: script '{}' exited with code {}",
+                                script_result.script_name, script_result.exit_code
+                            );
+                            if !script_result.script_output.is_empty() {
+                                println!("{}", script_result.script_output);
+                            }
+                            if !script_result.script_errors.is_empty() {
+                                eprintln!("Script errors:\n{}", script_result.script_errors);
+                            }
+                        }
+                        Err(e) => {
+                            // Fall back to raw byte count if the result isn't valid
+                            // ScriptResult JSON (shouldn't happen, but fail gracefully).
+                            eprintln!("Warning: could not parse script result: {e}");
+                            println!("Command {i} result: {} bytes", data.len());
+                        }
+                    }
+                } else {
                     println!("Command {i} result: {} bytes", data.len());
                 }
             }
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return ExitCode::FAILURE;
-            }
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::FAILURE;
         }
     }
 
@@ -183,6 +286,91 @@ mod tests {
         assert_eq!(
             cli.file.as_ref().unwrap().to_str().unwrap(),
             "/tmp/evidence.zip"
+        );
+    }
+
+    #[test]
+    fn runscript_parses_with_script_and_args() {
+        // Full RunScript invocation with --script and --args.
+        // Verifies that clap populates the script name and arguments.
+        let mut args = base_args();
+        args.extend_from_slice(&["-r", "--script", "whoami.ps1", "--args", "-Verbose"]);
+        let cli =
+            Cli::try_parse_from(args).expect("should parse RunScript with --script and --args");
+        assert!(cli.actions.run, "run flag should be set");
+        assert_eq!(cli.script.as_deref(), Some("whoami.ps1"));
+        assert_eq!(cli.args.as_deref(), Some("-Verbose"));
+    }
+
+    #[test]
+    fn runscript_parses_without_args() {
+        // RunScript with --script but no --args is valid — many scripts
+        // run without parameters.
+        let mut args = base_args();
+        args.extend_from_slice(&["-r", "--script", "collector.ps1"]);
+        let cli = Cli::try_parse_from(args).expect("should parse RunScript without --args");
+        assert!(cli.actions.run);
+        assert_eq!(cli.script.as_deref(), Some("collector.ps1"));
+        assert!(
+            cli.args.is_none(),
+            "--args should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn runscript_without_script_flag_parses_successfully() {
+        // Clap treats --script as optional (it's `Option<String>`), so
+        // parsing succeeds. The semantic check (--script required for -r)
+        // happens at runtime in main(), not at parse time. Same pattern
+        // as GetFile's --file requirement.
+        let mut args = base_args();
+        args.push("-r");
+        let cli = Cli::try_parse_from(args).expect("should parse with -r but no --script");
+        assert!(cli.actions.run, "run flag should be set");
+        assert!(
+            cli.script.is_none(),
+            "--script should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn putfile_parses_with_file() {
+        // Full PutFile invocation with --file.
+        let mut args = base_args();
+        args.extend_from_slice(&["-p", "--file", "C:\\tools\\agent.exe"]);
+        let cli = Cli::try_parse_from(args).expect("should parse PutFile with --file");
+        assert!(cli.actions.put, "put flag should be set");
+        assert_eq!(
+            cli.file.as_ref().unwrap().to_str().unwrap(),
+            "C:\\tools\\agent.exe"
+        );
+    }
+
+    #[test]
+    fn putfile_without_file_flag_parses_successfully() {
+        // Same pattern as GetFile — --file is optional at parse time,
+        // validated at runtime.
+        let mut args = base_args();
+        args.push("-p");
+        let cli = Cli::try_parse_from(args).expect("should parse with -p but no --file");
+        assert!(cli.actions.put, "put flag should be set");
+        assert!(
+            cli.file.is_none(),
+            "--file should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn conflicting_action_flags_are_rejected() {
+        // Clap's `group(multiple = false)` should reject multiple action
+        // flags. This prevents ambiguous invocations where the user passes
+        // both -g and -r, for example.
+        let mut args = base_args();
+        args.extend_from_slice(&["-g", "-r"]);
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when multiple action flags are provided"
         );
     }
 }

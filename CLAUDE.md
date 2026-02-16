@@ -2,14 +2,16 @@
 
 ## Project Overview
 
-**mde-lr** is an async Rust CLI client and library for Microsoft Defender for Endpoint (MDE) Live Response. It authenticates via Azure AD OAuth2 (client credentials flow) and orchestrates remote actions on managed devices: collecting files (`GetFile`) and executing PowerShell scripts (`RunScript`).
+**mde-lr** is an async Rust CLI client and library for Microsoft Defender for Endpoint (MDE) Live Response. It authenticates via Azure AD OAuth2 (client credentials flow) and orchestrates remote actions on managed devices: collecting files (`GetFile`), executing PowerShell scripts (`RunScript`), and uploading files (`PutFile`).
 
 ## Build & Run
 
 ```bash
-# Requires Rust 1.85+ (edition 2024). Stable channel pinned in rust-toolchain.toml.
+# Requires Rust 1.88.0 (edition 2024). Toolchain pinned in rust-toolchain.toml.
 cargo build
 cargo run -- --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> -g --file <PATH>
+cargo run -- --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> -r --script <NAME> [--args <ARGS>]
+cargo run -- --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> -p --file <PATH>
 
 # Run all tests (unit + integration)
 cargo test

@@ -2,7 +2,7 @@
 
 Status: Draft
 Owner: mde-lr maintainers
-Last updated: 2026-02-14
+Last updated: 2026-02-15
 
 ## 1. Purpose and Scope
 
@@ -65,7 +65,7 @@ is no parallelism across steps.
 | Unknown action statuses must not crash deserialization | Forward compatibility with API changes | `ActionStatus::Unknown` with `#[serde(other)]` |
 | SAS download must not attach bearer auth | SAS URL already carries authorization via query-string token | `MdeClient::download` |
 | Token endpoint uses form-encoded bodies, not JSON | Azure AD `/oauth2/v2.0/token` requires `application/x-www-form-urlencoded` | `src/auth.rs` (`reqwest::RequestBuilder::form()` serializes via `serde_urlencoded`) |
-| Public API surface returns fallible async results | Explicit failure handling across network boundaries | `Result<T, Box<dyn Error + Send + Sync>>` convention |
+| Public API surface returns fallible async results | Explicit failure handling across network boundaries | `Result<T, MdeError>` typed error hierarchy |
 
 ## 4. Module Architecture
 
@@ -73,10 +73,11 @@ is no parallelism across steps.
 
 | Module | Responsibility | External side effects |
 |---|---|---|
-| `src/lib.rs` | Crate root — re-exports `auth`, `client`, and `live_response` as the public API surface | None (module declaration only) |
-| `src/main.rs` | CLI parsing and command dispatch | stdout/stderr, process exit code |
+| `src/lib.rs` | Crate root — re-exports `auth`, `client`, `error`, and `live_response` as the public API surface | None (module declaration only) |
+| `src/main.rs` | CLI parsing and command dispatch for GetFile, RunScript, PutFile | stdout/stderr, process exit code |
 | `src/auth.rs` | OAuth2 token acquisition + cache lifecycle | HTTPS to Azure AD token endpoint |
 | `src/client.rs` | Authenticated HTTP wrapper and retry behavior | HTTPS to MDE API and SAS URLs |
+| `src/error.rs` | Typed error hierarchy (`MdeError`) for all library operations | None (type definitions only) |
 | `src/live_response.rs` | Live Response request/response models + orchestration | Polling loop + downloads |
 | `tests/live_response_flow.rs` | Integration behavior tests over mock HTTP | in-process mock server only |
 
@@ -198,16 +199,14 @@ HTTP request with Bearer header
   |      retry request once with fresh token
   |        |
   |        +--> 2xx: Ok(T)
-  |        +--> 401 again: Err (hard failure, no further retries)
-  |        +--> other status: Err (error_for_status)
+  |        +--> 401 again: Err(MdeError::Api { status, body })
+  |        +--> other status: Err(MdeError::Api { status, body })
   |
-  +--> 4xx/5xx (non-401): Err via error_for_status()
-  |      NOTE: error_for_status() discards the response body.
-  |      For non-401 API errors, the raw error body from MDE is lost.
-  |      This is a known limitation — typed errors (Phase 2) will
-  |      preserve the body for diagnostics.
+  +--> 4xx/5xx (non-401): Err(MdeError::Api { status, body })
+  |      response body is read and preserved before checking status,
+  |      so MDE's diagnostic error codes are available for debugging.
   |
-  +--> network error: Err (reqwest transport error)
+  +--> network error: Err(MdeError::Network(reqwest::Error))
 ```
 
 ### 5.3 Sequence Diagram: Complete Live Response Interaction
@@ -327,7 +326,9 @@ error. This provides forward compatibility if Microsoft adds new status values.
 |---|---|---|
 | `--device-id`, `--tenant-id`, `--client-id` | Required identity fields | Required for execution |
 | `--secret` / `MDE_CLIENT_SECRET` env var | Client secret for OAuth2 | Required; prefer env var to avoid process-list exposure |
-| `-g` + `--file` | GetFile action | Implemented end-to-end; `--file` is validated at runtime when `-g` is set |
+| `-g` + `--file` | GetFile action | Collect a file from the remote device; `--file` is validated at runtime |
+| `-r` + `--script` [+ `--args`] | RunScript action | Execute a PowerShell script on the remote device; `--script` is validated at runtime, `--args` is optional and allows hyphen-prefixed values |
+| `-p` + `--file` | PutFile action | Upload a file from the MDE library to the remote device; `--file` is validated at runtime |
 | `--config`, `--query` | Future placeholders | Parsed but currently unused |
 
 **Exit codes:**
@@ -335,9 +336,14 @@ error. This provides forward compatibility if Microsoft adds new status values.
 - `1`: runtime error (auth failure, API error, timeout, etc.)
 - `2`: argument validation error (clap handles this automatically)
 
-**Action flag constraint:** Exactly one of `-g`, `-p`, `-d` must be set per
+**Action flag constraint:** Exactly one of `-g`, `-r`, `-p` must be set per
 invocation. This is enforced at parse time by clap's `#[group(required = true,
 multiple = false)]` attribute on `ActionFlags`.
+
+**RunScript output handling:** When `-r` is used, the CLI automatically parses
+the downloaded bytes as `ScriptResult` JSON and displays the script name, exit
+code, stdout, and stderr. If parsing fails (unexpected response format), the
+CLI falls back to displaying the raw byte count.
 
 ## 8. Reliability and Failure Semantics
 
@@ -347,11 +353,11 @@ multiple = false)]` attribute on `ActionFlags`.
 |---|---|---|
 | Token request fails (network/AADSTS) | Error includes HTTP status + raw response body text | Yes — body is read as text before status check |
 | API returns 401 (first time) | One forced token refresh + single retry | N/A (retry, not error) |
-| API returns 401 (second time) | Hard error via `error_for_status()` | No — body discarded |
-| API returns non-401 error (403, 404, 500, etc.) | Immediate error via `error_for_status()` | No — body discarded |
+| API returns 401 (second time) | Hard `MdeError::Api` with status + body | Yes — body preserved |
+| API returns non-401 error (403, 404, 500, etc.) | Immediate `MdeError::Api` with status + body | Yes — body preserved |
 | Action reaches `Failed` or `Cancelled` | Return error containing status variant + action id | N/A (status-based error) |
 | Polling exceeds timeout | Return error including timeout duration + action id | N/A (timeout error) |
-| SAS download fails | Return HTTP error from download request | No — body discarded |
+| SAS download fails | `MdeError::Api` with status + body, or `MdeError::Network` | Yes — body preserved for HTTP errors |
 | Unknown action status during polling | Keep polling until terminal status or timeout | N/A (non-terminal) |
 | Network error (DNS, TCP, TLS) | Return reqwest transport error | N/A (no response) |
 
@@ -367,20 +373,14 @@ HTTP Response from MDE API
     │                        retry request once
     │                           │
     │                           ├── 2xx ──────> Ok(T)
-    │                           ├── 401 (2nd) ─> Err (hard failure)
-    │                           └── other ─────> Err (error_for_status)
+    │                           ├── 401 (2nd) ─> Err (MdeError::Api, body preserved)
+    │                           └── other ─────> Err (MdeError::Api, body preserved)
     │
-    ├── 4xx/5xx (non-401) ─> Err via error_for_status()
-    │                        (response body is discarded — known limitation)
+    ├── 4xx/5xx (non-401) ─> Err via MdeError::Api { status, body }
+    │                        (response body is preserved for diagnostics)
     │
-    └── network error ─────> Err (reqwest transport error)
+    └── network error ─────> Err (MdeError::Network wrapping reqwest::Error)
 ```
-
-**Known limitation:** `error_for_status()` discards the HTTP response body. For
-non-401 API errors, the detailed error message from MDE (which can include
-diagnostic codes and human-readable explanations) is lost. The planned typed
-error enum (Phase 2) will read the body before checking status, matching the
-pattern already used in `auth.rs` for token errors.
 
 ## 9. Configuration and Defaults
 
@@ -407,9 +407,12 @@ lenient for token failures.
 
 | Test layer | Scope | Notable assertions |
 |---|---|---|
-| Unit tests in `src/auth.rs` | Token URL construction, serde, cache expiry/buffer logic | Token invalid before refresh, expiry is deterministic, buffer boundary behavior |
-| Unit tests in `src/live_response.rs` | API model serde, unknown status handling, poll defaults, request round-trips | Forward-compatible enum parsing, PascalCase serialization |
-| Integration tests in `tests/live_response_flow.rs` | Full 4-step wiremock flow | End-to-end bytes returned, RunScript parse path, failed action error, multi-command indexing |
+| Unit tests in `src/auth.rs` (11 tests) | Token URL construction, serde, cache expiry/buffer logic | Token invalid before refresh, expiry is deterministic, buffer boundary behavior |
+| Unit tests in `src/client.rs` (5 tests) | HTTP methods, 401 retry, error body preservation, SAS download auth | One-shot retry succeeds/fails, 403 body preserved, no bearer on SAS URLs |
+| Unit tests in `src/error.rs` (7 tests) | Error display, source chaining, Send+Sync | All variants display correctly, source chain traversable |
+| Unit tests in `src/live_response.rs` (10 tests) | API model serde, unknown status handling, poll defaults, request round-trips | Forward-compatible enum parsing, PascalCase serialization, PutFile variant |
+| Unit tests in `src/main.rs` (9 tests) | CLI argument parsing for all three actions | Action flag enforcement, parameter validation, conflicting flags rejected |
+| Integration tests in `tests/live_response_flow.rs` (7 tests) | Full 4-step wiremock flow | End-to-end bytes returned, RunScript parse path, failed/cancelled actions, polling timeout, multi-step progression, multi-command indexing |
 
 ### 10.2 How the Mock Server Works
 
@@ -435,9 +438,10 @@ in-process HTTP server, with no network calls to real Azure services.
   returns `Succeeded` immediately, so the test only sleeps once (5s). Tests
   that need to exercise the timeout path should pass a custom `PollConfig` with
   a short interval and timeout.
-- **No tests for 401 retry path yet.** The `send_json` retry logic is
-  implemented but not covered by integration tests. This is tracked as a
-  Phase 3 gap.
+- **401 retry path is tested in `client.rs` unit tests.** Two tests cover
+  the retry behavior: `send_json_retries_once_on_401_then_succeeds` and
+  `send_json_returns_api_error_after_double_401`. These use wiremock with
+  a mock token endpoint via `test_client_with_token_endpoint()`.
 
 ## 11. Key Design Decisions
 
@@ -454,15 +458,18 @@ in-process HTTP server, with no network calls to real Azure services.
 
 ## 12. Current Gaps and Next Architectural Steps
 
-| Gap | Impact | Suggested direction | Plan phase |
-|---|---|---|---|
-| Only `-g` (GetFile) action implemented | CLI supports one action type | Add `-p` (PutFile) and RunScript flags when execution paths are ready | — |
-| No structured logging/tracing | Harder production debugging of polling and retries | Add `tracing` spans around auth, poll loop, and downloads | — |
-| Boxed dynamic errors everywhere | Coarse error taxonomy for callers; response bodies lost on non-401 errors | Introduce typed `MdeError` enum with source chaining | Phase 2a |
-| Results are fully buffered in memory | Large downloads increase memory pressure | Add optional streaming write-to-disk path | — |
-| No 401 retry integration tests | Retry logic is implemented but untested end-to-end | Add wiremock tests with staged 401 → success responses | Phase 3b |
-| Hardcoded cloud endpoints | Cannot target sovereign/government clouds | Make token URL and API base URL configurable via constructors | Phase 2b |
-| No `#![warn(missing_docs)]` | Public API can drift without documentation | Enable after public surface is stabilized | Phase 2c |
+| Gap | Impact | Suggested direction |
+|---|---|---|
+| No structured logging/tracing | Harder production debugging of polling and retries | Add `tracing` spans around auth, poll loop, and downloads |
+| Results are fully buffered in memory | Large downloads increase memory pressure | Add optional streaming write-to-disk path |
+| Workspace split | Single crate serves both CLI and library consumers | Split into `mde-lr` (CLI binary) and `mde-lr-lib` (library crate) when a second consumer emerges |
+
+Resolved gaps (completed in Phases 1-4):
+- Typed `MdeError` enum with source chaining (Phase 2a)
+- Configurable cloud endpoints for sovereign clouds (Phase 2b)
+- `#![warn(missing_docs)]` enabled (Phase 2c)
+- 401 retry integration tests with wiremock (Phase 3b)
+- All three Live Response actions implemented: GetFile, RunScript, PutFile (Phase 4)
 
 ## 13. Inspiration Notes
 

@@ -2,7 +2,7 @@
 name = "mde-lr"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Async Rust CLI and library for Microsoft Defender for Endpoint Live Response"
 readme = "README.md"
 keywords = ["mde", "defender", "live-response", "azure", "security"]

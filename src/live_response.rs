@@ -49,6 +49,8 @@ pub enum CommandType {
     RunScript,
     /// Collect a file from the device and return its contents.
     GetFile,
+    /// Upload a file from the MDE library to the device.
+    PutFile,
 }
 
 /// A key-value parameter for a Live Response command.
@@ -291,8 +293,10 @@ mod tests {
     fn command_type_serializes_as_expected_strings() {
         let get_file = serde_json::to_string(&CommandType::GetFile).unwrap();
         let run_script = serde_json::to_string(&CommandType::RunScript).unwrap();
+        let put_file = serde_json::to_string(&CommandType::PutFile).unwrap();
         assert_eq!(get_file, "\"GetFile\"");
         assert_eq!(run_script, "\"RunScript\"");
+        assert_eq!(put_file, "\"PutFile\"");
     }
 
     #[test]

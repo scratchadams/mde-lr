@@ -15,7 +15,7 @@ The CLI handles token acquisition, token refresh, bounded polling with timeout, 
 
 ## Prerequisites
 
-- **Rust 1.85 or later** — the project uses `edition = "2024"`, which stabilized in Rust 1.85. The stable channel is pinned in `rust-toolchain.toml`, so `rustup` will select it automatically.
+- **Rust 1.88.0** — this repository pins a specific toolchain in `rust-toolchain.toml` and declares `rust-version = "1.88"` in `Cargo.toml`. Using the pinned version avoids proc-macro ABI drift in editor tooling.
 - **Azure AD app registration** with the following:
   - `WindowsDefenderATP` API permissions for Live Response (application-level, admin-consented).
   - A client secret (or access to one via environment variable).
@@ -44,7 +44,31 @@ mde-lr \
   -g --file "C:\Windows\TEMP\evidence.zip"
 ```
 
-On success, the CLI prints the byte count of each downloaded result. On failure, it prints the error to stderr and exits with a non-zero code.
+### Execute a Script on a Remote Device
+
+```bash
+mde-lr \
+  --device-id <DEVICE_ID> \
+  --tenant-id <AZURE_TENANT_ID> \
+  --client-id <AZURE_CLIENT_ID> \
+  --secret <CLIENT_SECRET> \
+  -r --script "Invoke-VerboseTraceroute.ps1" --args "8.8.8.8,1.1.1.1"
+```
+
+The script must already exist in the MDE Live Response library. On success, the CLI displays the script name, exit code, stdout, and stderr.
+
+### Upload a File to a Remote Device
+
+```bash
+mde-lr \
+  --device-id <DEVICE_ID> \
+  --tenant-id <AZURE_TENANT_ID> \
+  --client-id <AZURE_CLIENT_ID> \
+  --secret <CLIENT_SECRET> \
+  -p --file "C:\tools\agent.exe"
+```
+
+On success, the CLI prints the byte count of each result. On failure, it prints the error to stderr and exits with a non-zero code.
 
 ### Authentication via Environment Variable (Recommended)
 
@@ -53,11 +77,17 @@ To avoid exposing the client secret in process listings and shell history, set i
 ```bash
 export MDE_CLIENT_SECRET="your-client-secret"
 
-mde-lr \
-  --device-id <DEVICE_ID> \
-  --tenant-id <AZURE_TENANT_ID> \
-  --client-id <AZURE_CLIENT_ID> \
+# GetFile
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> \
   -g --file "C:\temp\log.zip"
+
+# RunScript
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> \
+  -r --script "whoami.ps1"
+
+# PutFile
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> \
+  -p --file "C:\tools\utility.exe"
 ```
 
 The `--secret` flag reads from `MDE_CLIENT_SECRET` automatically when not provided on the command line.
@@ -70,10 +100,12 @@ The `--secret` flag reads from `MDE_CLIENT_SECRET` automatically when not provid
 | `--tenant-id` | Yes | Azure AD tenant ID for OAuth2 |
 | `--client-id` | Yes | Azure AD application (client) ID |
 | `--secret` | Yes | Client secret (or set `MDE_CLIENT_SECRET` env var) |
-| `-g` | Yes | GetFile action — collect a file from the remote device |
-| `--file` | When using `-g` | Remote file path to collect |
-
-Currently only `-g` (GetFile) is implemented. Additional action flags will be added when PutFile and RunScript CLI paths are ready.
+| `-g` | One of `-g`/`-r`/`-p` | GetFile action — collect a file from the remote device |
+| `-r` | One of `-g`/`-r`/`-p` | RunScript action — execute a PowerShell script on the device |
+| `-p` | One of `-g`/`-r`/`-p` | PutFile action — upload a file from the MDE library to the device |
+| `--file` | When using `-g` or `-p` | Remote file path to collect or upload |
+| `--script` | When using `-r` | Name of the script to execute (must exist in MDE library) |
+| `--args` | No | Arguments to pass to the script (supports hyphen-prefixed values) |
 
 ### Exit Codes
 
@@ -176,6 +208,19 @@ async fn main() -> Result<(), MdeError> {
     println!("Exit code: {}", script_result.exit_code);
     println!("Output: {}", script_result.script_output);
 
+    // PutFile example — upload a file from the MDE library to the device
+    let put_request = LiveResponseRequest {
+        comment: "Deploy utility".to_string(),
+        commands: vec![Command {
+            command_type: CommandType::PutFile,
+            params: vec![Param {
+                key: "Path".to_string(),
+                value: "C:\\tools\\agent.exe".to_string(),
+            }],
+        }],
+    };
+    let _results = run_live_response(&client, "device-id", &put_request, None).await?;
+
     Ok(())
 }
 ```
@@ -212,7 +257,7 @@ async fn main() -> Result<(), MdeError> {
 # Build
 cargo build
 
-# Run all tests (27 unit + 4 integration)
+# Run all tests (43 unit + 7 integration)
 cargo test
 
 # Run a specific test
@@ -250,8 +295,9 @@ All four steps of the live response flow execute without any real network calls.
 
 ## Roadmap
 
-The project follows a phased plan. Phase 1 (production correctness) is complete:
+The project follows a phased plan. Phases 1-4 are complete:
 
+**Phase 1** (production correctness):
 - [x] Token expiry tracking with safety buffer
 - [x] Bounded polling with configurable timeout
 - [x] Typed action status enum with forward compatibility
@@ -260,20 +306,29 @@ The project follows a phased plan. Phase 1 (production correctness) is complete:
 - [x] CLI exit codes and argument validation
 - [x] Client secret via environment variable
 
-Phase 2 (library hardening) is complete:
-
+**Phase 2** (library hardening):
 - [x] Typed `MdeError` enum with thiserror (preserves API error bodies)
 - [x] Configurable cloud endpoints (sovereign/government clouds)
 - [x] Public API surface audit and `#![warn(missing_docs)]`
-- [x] Stable toolchain migration (edition 2024 on Rust 1.85+)
+- [x] Stable toolchain migration with explicit pinning (`1.88.0`)
 - [x] Crate metadata (description, keywords, license)
+
+**Phase 3** (quality gates):
+- [x] CI workflow (fmt, clippy, test, doc)
+- [x] Integration tests for 401 retry and polling timeout paths
+- [x] Expanded test coverage (50 total: 43 unit + 7 integration)
+
+**Phase 4** (CLI feature expansion):
+- [x] RunScript CLI action (`-r --script --args`)
+- [x] PutFile CLI action (`-p --file`)
+- [x] Structured script result output (exit code, stdout, stderr)
+- [x] Documentation updates across all project files
 
 Planned next:
 
-- [ ] CI workflow (fmt, clippy, test, doc)
-- [ ] Integration tests for 401 retry and polling timeout paths
-- [ ] PutFile and RunScript CLI action implementations
-- [ ] Structured logging/tracing
+- [ ] Structured logging/tracing (`tracing` crate)
+- [ ] Streaming write-to-disk for large file downloads
+- [ ] Workspace split (separate library/CLI crates) when a second consumer emerges
 
 See [architecture.md](architecture.md) for detailed design documentation including state diagrams, sequence diagrams, and decision records.
 
