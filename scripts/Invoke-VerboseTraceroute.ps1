@@ -73,8 +73,22 @@ foreach ($target in $targets) {
     if (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue) {
         Write-Output "[DNS Resolution]"
         try {
-            $dns = Resolve-DnsName -Name $target -Type A,AAAA -ErrorAction Stop
-            $dns | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
+            $dnsResults = @()
+            foreach ($recordType in @("A", "AAAA")) {
+                try {
+                    $dnsResults += Resolve-DnsName -Name $target -Type $recordType -ErrorAction Stop
+                }
+                catch {
+                    # Not all targets have both A and AAAA records; continue gathering what exists.
+                }
+            }
+
+            if ($dnsResults.Count -gt 0) {
+                $dnsResults | Format-Table -AutoSize | Out-String -Width 4096 | Write-Output
+            }
+            else {
+                Write-Output "No A/AAAA DNS records resolved for target."
+            }
         }
         catch {
             Write-Output ("DNS resolution failed: {0}" -f $_.Exception.Message)
@@ -91,11 +105,11 @@ foreach ($target in $targets) {
     }
     $tracertArgs += $target
     Write-Output ("Command: tracert.exe {0}" -f ($tracertArgs -join " "))
+    Write-Output ("Expected worst-case duration for this target: ~{0:n1}s" -f (($MaxHops * $TimeoutMs) / 1000))
 
     try {
-        $tracertOutput = & tracert.exe @tracertArgs 2>&1
+        & tracert.exe @tracertArgs 2>&1 | ForEach-Object { Write-Output $_ }
         $tracertExit = $LASTEXITCODE
-        $tracertOutput | ForEach-Object { Write-Output $_ }
         Write-Output ("tracert exit code: {0}" -f $tracertExit)
         if ($tracertExit -ne 0) {
             $failedTargets.Add($target)

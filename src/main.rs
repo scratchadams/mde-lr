@@ -40,8 +40,9 @@ struct Cli {
     config: Option<std::path::PathBuf>,
 
     /// MDE device ID to target for live response actions.
+    /// Required for -g, -r, -p but not for -t (token inspection).
     #[arg(long)]
-    device_id: String,
+    device_id: Option<String>,
 
     /// Azure AD tenant ID for OAuth2 authentication.
     #[arg(long)]
@@ -85,13 +86,58 @@ struct ActionFlags {
     /// Requires --file.
     #[arg(short)]
     put: bool,
+
+    /// Acquire an OAuth2 token and print it to stdout for inspection.
+    /// Does not require --device-id. Useful for debugging auth configuration,
+    /// verifying credentials, and inspecting token claims via jwt.ms or jwt.io.
+    #[arg(short)]
+    token: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Cli::parse();
 
-    println!("DeviceID: {}", args.device_id);
+    // Token inspection mode: acquire a token and print it, then exit.
+    // This path doesn't need --device-id or an MdeClient — it only
+    // talks to Azure AD to verify that credentials are valid and to
+    // let the operator inspect the token (e.g. paste into jwt.ms to
+    // check claims, scopes, and expiry).
+    if args.actions.token {
+        let mut tp = TokenProvider::new(
+            &args.tenant_id,
+            &args.client_id,
+            &args.secret,
+            "https://api.securitycenter.microsoft.com/.default",
+        );
+        match tp.refresh_token().await {
+            Ok(()) => match tp.token() {
+                Some(token) => {
+                    println!("{token}");
+                    return ExitCode::SUCCESS;
+                }
+                None => {
+                    eprintln!("Error: token missing after successful refresh");
+                    return ExitCode::FAILURE;
+                }
+            },
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // All remaining actions require --device-id to target a specific machine.
+    let device_id = match &args.device_id {
+        Some(id) => id.as_str(),
+        None => {
+            eprintln!("Error: --device-id is required for live response actions (-g, -r, -p)");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("DeviceID: {device_id}");
     let tp = TokenProvider::new(
         &args.tenant_id,
         &args.client_id,
@@ -180,7 +226,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    match run_live_response(&client, &args.device_id, &request, None).await {
+    match run_live_response(&client, device_id, &request, None).await {
         Ok(results) => {
             for (i, data) in results.iter().enumerate() {
                 // For RunScript results, parse and display the structured output
@@ -278,7 +324,7 @@ mod tests {
         let mut args = base_args();
         args.extend_from_slice(&["-g", "--file", "/tmp/evidence.zip"]);
         let cli = Cli::try_parse_from(args).expect("should parse a complete valid command");
-        assert_eq!(cli.device_id, "dev-123");
+        assert_eq!(cli.device_id.as_deref(), Some("dev-123"));
         assert_eq!(cli.tenant_id, "tid-456");
         assert_eq!(cli.client_id, "cid-789");
         assert_eq!(cli.secret, "s3cret");
@@ -371,6 +417,43 @@ mod tests {
         assert!(
             result.is_err(),
             "parsing should fail when multiple action flags are provided"
+        );
+    }
+
+    #[test]
+    fn token_flag_parses_without_device_id() {
+        // Token inspection (-t) doesn't target a device, so --device-id
+        // should not be required. This lets operators verify their Azure AD
+        // credentials without needing to know a device ID.
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "-t",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse -t without --device-id");
+        assert!(cli.actions.token, "token flag should be set");
+        assert!(
+            cli.device_id.is_none(),
+            "--device-id should be None when not provided"
+        );
+    }
+
+    #[test]
+    fn token_flag_conflicts_with_action_flags() {
+        // -t is mutually exclusive with -g, -r, -p because it's in the
+        // same action group. You either inspect a token or run a live
+        // response action, not both.
+        let mut args = base_args();
+        args.extend_from_slice(&["-t", "-g"]);
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when -t is combined with another action flag"
         );
     }
 }
