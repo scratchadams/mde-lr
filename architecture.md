@@ -15,10 +15,10 @@ today is `GetFile`; the core orchestration is generic enough to support
 `RunScript` and multi-command sessions.
 
 **Toolchain requirement:** The project uses `edition = "2024"` (set in
-`Cargo.toml`) which requires **Rust 1.85 or later**. The stable channel is
-pinned in `rust-toolchain.toml` and the MSRV is declared via `rust-version` in
-`Cargo.toml`. Ensure `rustup` is installed and it will select the correct
-toolchain automatically.
+`Cargo.toml`) and is pinned to **Rust 1.88.0** via `rust-toolchain.toml` with
+`rust-version = "1.88"` declared in `Cargo.toml`. A fixed version avoids
+proc-macro ABI drift between Cargo builds and editor tooling (e.g.
+`Serialize`/`Deserialize` derives in rust-analyzer).
 
 ## 2. System Context
 
