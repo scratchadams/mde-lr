@@ -42,7 +42,7 @@ toolchain automatically.
                                                        v
                                        +-------------------------------+
                                        | Azure Blob (SAS)              |
-                                       | downloaded result payload      |
+                                       | downloaded result payload     |
                                        +-------------------------------+
 
 Separate auth dependency:
@@ -108,7 +108,7 @@ API surface.
                                v              v
                    +----------------+   +------------------------+
                    | TokenProvider  |   | run_live_response()    |
-                   | (auth.rs)     |   | (live_response.rs)     |
+                   | (auth.rs)      |   | (live_response.rs)     |
                    +----------------+   | free function, borrows |
                                         | &MdeClient             |
                                         +------------------------+
@@ -263,22 +263,22 @@ The token follows a cyclic state machine. Transitions are driven by time
 (expiry), API feedback (401), and explicit calls (refresh, invalidate).
 
 ```text
-                 ┌───────────────────────────────────────────────┐
-                 │                                               │
-                 v                                               │
-         ┌──────────────┐     refresh_token()     ┌───────────┐ │
-    ──>  │   NoToken    │ ───────────────────────> │ ValidToken│ │
+                 ┌────────────────────────────────────────────────┐
+                 │                                                │
+                 v                                                │
+         ┌──────────────┐     refresh_token()      ┌────────────┐ │
+    ──>  │   NoToken    │ ───────────────────────> │ ValidToken │ │
          │ token()=None │                          │token()=Some│ │
-         └──────────────┘                          └─────┬─────┘ │
-                 ^                                       │       │
-                 │                                       │       │
-                 │  invalidate()          elapsed >=     │       │
-                 │  (called on 401)       (expires_in    │       │
-                 │                         - 60s)        v       │
-                 │                               ┌───────────┐  │
-                 └───────────────────────────────│  Expired   │  │
-                                                 │token()=None│──┘
-                                                 └───────────┘
+         └──────────────┘                          └─────┬──────┘ │
+                 ^                                       │        │
+                 │                                       │        │
+                 │  invalidate()          elapsed >=     │        │
+                 │  (called on 401)       (expires_in    │        │
+                 │                         - 60s)        v        │
+                 │                               ┌────────────┐   │
+                 └───────────────────────────────│  Expired   │   │
+                                                 │token()=None│───┘
+                                                 └────────────┘
 
   Entry states:
     - Construction via new(): starts in NoToken
