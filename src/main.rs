@@ -8,6 +8,7 @@
 //! - 1: runtime error (auth failure, API error, timeout, etc.)
 //! - 2: argument validation error (clap handles this automatically)
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -35,6 +36,15 @@ struct Cli {
     /// PowerShell parameters commonly use that syntax.
     #[arg(long, allow_hyphen_values = true)]
     args: Option<String>,
+
+    /// Output file path for saving downloaded results to disk.
+    /// Required for GetFile (otherwise the downloaded bytes are lost).
+    /// For RunScript, the raw JSON result is written to this path in
+    /// addition to the structured output printed to stdout.
+    /// When multiple commands produce results, files are written with
+    /// an index suffix (e.g. "output_0.zip", "output_1.zip").
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 
     #[arg(long)]
     config: Option<std::path::PathBuf>,
@@ -92,6 +102,29 @@ struct ActionFlags {
     /// verifying credentials, and inspecting token claims via jwt.ms or jwt.io.
     #[arg(short)]
     token: bool,
+}
+
+/// Computes the output file path for a given command index.
+///
+/// When the request contains a single command, the path is used as-is
+/// (e.g. `--out results.zip` → `results.zip`). When there are multiple
+/// commands, an index suffix is inserted before the file extension to
+/// disambiguate results (e.g. `results.zip` → `results_0.zip`,
+/// `results_1.zip`). This prevents later commands from silently
+/// overwriting earlier results.
+fn output_path_for_index(base: &std::path::Path, index: usize, total: usize) -> PathBuf {
+    if total <= 1 {
+        return base.to_path_buf();
+    }
+    // Insert "_N" before the extension: "foo.zip" → "foo_0.zip"
+    // If there's no extension: "foo" → "foo_0"
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = base.extension().map(|e| e.to_string_lossy());
+    let indexed_name = match ext {
+        Some(ext) => format!("{stem}_{index}.{ext}"),
+        None => format!("{stem}_{index}"),
+    };
+    base.with_file_name(indexed_name)
 }
 
 #[tokio::main]
@@ -229,6 +262,32 @@ async fn main() -> ExitCode {
     match run_live_response(&client, device_id, &request, None).await {
         Ok(results) => {
             for (i, data) in results.iter().enumerate() {
+                // Write result bytes to disk when --out is provided.
+                // For a single command, the file is written to the exact --out path.
+                // For multiple commands, an index suffix is inserted before the
+                // extension (e.g. "output.zip" → "output_0.zip", "output_1.zip")
+                // to avoid overwriting results.
+                if let Some(out_path) = &args.out {
+                    let dest = output_path_for_index(out_path, i, results.len());
+                    match std::fs::write(&dest, data) {
+                        Ok(()) => {
+                            println!(
+                                "Command {i}: wrote {} bytes to {}",
+                                data.len(),
+                                dest.display()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Error: failed to write {} bytes to {}: {e}",
+                                data.len(),
+                                dest.display()
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+
                 // For RunScript results, parse and display the structured output
                 // (exit code, stdout, stderr) rather than just the byte count.
                 // GetFile and PutFile results are opaque binary data where the
@@ -254,7 +313,9 @@ async fn main() -> ExitCode {
                             println!("Command {i} result: {} bytes", data.len());
                         }
                     }
-                } else {
+                } else if args.out.is_none() {
+                    // Only print the byte count summary when --out is not provided,
+                    // since the write confirmation already includes the byte count.
                     println!("Command {i} result: {} bytes", data.len());
                 }
             }
@@ -454,6 +515,96 @@ mod tests {
         assert!(
             result.is_err(),
             "parsing should fail when -t is combined with another action flag"
+        );
+    }
+
+    // ── --out flag tests ─────────────────────────────────────────────
+
+    #[test]
+    fn getfile_parses_with_out_flag() {
+        // GetFile with --out specifies where to write the downloaded bytes.
+        // This is the primary use case for --out — without it, GetFile
+        // downloads bytes but has nowhere to save them.
+        let mut args = base_args();
+        args.extend_from_slice(&[
+            "-g",
+            "--file",
+            "/tmp/evidence.zip",
+            "--out",
+            "/tmp/local.zip",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("should parse -g with --out");
+        assert!(cli.actions.get);
+        assert_eq!(
+            cli.out.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/local.zip"
+        );
+    }
+
+    #[test]
+    fn runscript_parses_with_out_flag() {
+        // RunScript with --out saves the raw JSON result to disk in
+        // addition to printing structured output to stdout.
+        let mut args = base_args();
+        args.extend_from_slice(&[
+            "-r",
+            "--script",
+            "collector.ps1",
+            "--out",
+            "/tmp/result.json",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("should parse -r with --out");
+        assert!(cli.actions.run);
+        assert_eq!(
+            cli.out.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/result.json"
+        );
+    }
+
+    #[test]
+    fn out_flag_defaults_to_none() {
+        // --out is optional. When omitted, results are printed to stdout
+        // (byte count for GetFile/PutFile, structured output for RunScript).
+        let mut args = base_args();
+        args.extend_from_slice(&["-g", "--file", "/tmp/evidence.zip"]);
+        let cli = Cli::try_parse_from(args).expect("should parse without --out");
+        assert!(cli.out.is_none(), "--out should be None when not provided");
+    }
+
+    // ── output_path_for_index tests ──────────────────────────────────
+
+    #[test]
+    fn output_path_single_command_returns_base_unchanged() {
+        // When there's only one command, no index suffix is needed —
+        // the user's --out path is used exactly as given.
+        let base = PathBuf::from("/tmp/result.zip");
+        let result = output_path_for_index(&base, 0, 1);
+        assert_eq!(result, PathBuf::from("/tmp/result.zip"));
+    }
+
+    #[test]
+    fn output_path_multiple_commands_inserts_index_before_extension() {
+        // When multiple commands produce results, an index is inserted
+        // before the extension to prevent overwriting. This matches the
+        // common convention used by tools like wget and curl.
+        let base = PathBuf::from("/tmp/result.zip");
+        assert_eq!(
+            output_path_for_index(&base, 0, 3),
+            PathBuf::from("/tmp/result_0.zip")
+        );
+        assert_eq!(
+            output_path_for_index(&base, 2, 3),
+            PathBuf::from("/tmp/result_2.zip")
+        );
+    }
+
+    #[test]
+    fn output_path_no_extension_appends_index() {
+        // Files without extensions get the index appended directly.
+        let base = PathBuf::from("/tmp/output");
+        assert_eq!(
+            output_path_for_index(&base, 1, 2),
+            PathBuf::from("/tmp/output_1")
         );
     }
 }

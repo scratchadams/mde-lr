@@ -90,6 +90,25 @@ pub enum MdeError {
         action_id: String,
     },
 
+    /// A throttled (`429 Too Many Requests`) request could not proceed.
+    ///
+    /// The MDE API enforces per-endpoint rate limits (typically 100 calls/min,
+    /// 1500 calls/hr). When exceeded, it returns 429 with a `Retry-After`
+    /// header. The client honors this header up to `RetryPolicy::max_retries`
+    /// times. This error is returned when retries are exhausted, when the
+    /// `Retry-After` value exceeds `RetryPolicy::max_retry_delay`, or when
+    /// retry is intentionally disabled for non-replayable request bodies
+    /// (for example multipart uploads).
+    ///
+    /// Callers should back off at the application level or reduce request
+    /// frequency before retrying.
+    #[error("request throttled (429): retry after {retry_after_secs}s")]
+    Throttled {
+        /// The `Retry-After` value (in seconds) from the last 429 response.
+        /// Indicates how long the server wants the client to wait.
+        retry_after_secs: u64,
+    },
+
     /// JSON deserialization failed when parsing an API response body.
     ///
     /// This can occur if the MDE API returns an unexpected response shape,
@@ -209,6 +228,26 @@ mod tests {
         assert!(
             err.source().is_some(),
             "Parse variant should chain to serde_json::Error"
+        );
+    }
+
+    #[test]
+    fn throttled_error_displays_retry_after() {
+        let err = MdeError::Throttled {
+            retry_after_secs: 30,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("429"),
+            "display should indicate 429 throttling"
+        );
+        assert!(
+            msg.contains("30"),
+            "display should include the retry-after seconds"
+        );
+        assert!(
+            !msg.contains("retries exhausted"),
+            "display should avoid implying one specific throttle-failure mode"
         );
     }
 

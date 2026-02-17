@@ -28,11 +28,14 @@ src/
   lib.rs              # Crate root — re-exports modules, #![warn(missing_docs)]
   main.rs             # CLI entry point (clap-derived args, exit codes)
   auth.rs             # OAuth2 TokenProvider — token acquisition, caching, expiry
-  client.rs           # MdeClient — authenticated HTTP wrapper with 401 retry
+  client.rs           # MdeClient — authenticated HTTP wrapper with 401/429 retry
   error.rs            # MdeError — typed error hierarchy (thiserror)
   live_response.rs    # Live Response models + 4-step orchestration
 tests/
   live_response_flow.rs  # Integration tests using wiremock
+  manifest_validation.rs # Endpoint manifest TOML validation
+manifest/
+  endpoints.toml         # MDE API endpoint inventory
 ```
 
 ## Architecture
@@ -52,11 +55,15 @@ Key design decisions:
 
 ## Conventions
 
-- **Error type**: `MdeError` (typed enum via thiserror) with variants: `Auth`, `Api`, `Timeout`, `ActionFailed`, `Parse`, `Network`
+- **Error type**: `MdeError` (typed enum via thiserror) with variants: `Auth`, `Api`, `Timeout`, `ActionFailed`, `Throttled`, `Parse`, `Network`
 - **Serde**: PascalCase field renaming for MDE API contract fidelity (`#[serde(rename = "Commands")]`)
 - **Comments**: Explain "why," not "what" — per AGENTS.md
 - **Docs**: `#![warn(missing_docs)]` enforced on all public items
 - **Testing**: Every public function has tests; tests encode semantics, not implementation
+- **Observability**: Networked flows should emit actionable context (endpoint,
+  method, status, retry/timeout signals, and operation identifiers such as
+  action ID when available) so failures are diagnosable in both runtime logs
+  and tests.
 - **No panics** in production paths; early returns with `?`
 - **Async/await** everywhere via Tokio; no blocking calls
 
@@ -71,12 +78,13 @@ Key design decisions:
 | Crate | Purpose |
 |-------|---------|
 | `clap` (derive, env) | CLI argument parsing with env var support |
-| `reqwest` (json, form) | Async HTTP client |
+| `reqwest` (json, form, multipart) | Async HTTP client |
 | `serde` / `serde_json` | JSON serialization |
 | `serde_urlencoded` | Form-encoded serialization for token requests |
 | `thiserror` | Typed error derivation |
 | `tokio` (full) | Async runtime |
 | `bytes` | Byte buffer handling |
+| `toml` (dev) | TOML deserialization for manifest validation |
 | `wiremock` (dev) | HTTP mocking for tests |
 
 ## PR Checklist

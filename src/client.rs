@@ -43,6 +43,67 @@ const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (polling, download links) complete well within this limit.
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Configurable retry policy for non-auth HTTP failures.
+///
+/// When the MDE API returns `429 Too Many Requests`, the response includes a
+/// `Retry-After` header indicating how many seconds the client must wait before
+/// retrying. This policy controls how many times the client will honor that
+/// header before giving up, and caps the maximum delay per retry to prevent
+/// unreasonably long waits.
+///
+/// The retry policy applies only to 429 responses — it is independent of the
+/// one-shot 401 retry for stale tokens (which is always enabled).
+///
+/// Defaults:
+/// - `max_retries`: 3 attempts. Most transient throttling resolves within
+///   1-2 retries. Three attempts balances persistence against wasted time.
+/// - `max_retry_delay`: 60 seconds. Caps the `Retry-After` header value to
+///   prevent a single request from blocking for minutes. If the server asks
+///   for more than 60s, the client treats it as a hard throttle and returns
+///   `MdeError::Throttled`.
+#[derive(Clone)]
+pub struct RetryPolicy {
+    /// Maximum number of retry attempts for 429 responses.
+    pub max_retries: u32,
+    /// Upper bound on any single retry delay. If the `Retry-After` header
+    /// exceeds this value, the request fails immediately with `MdeError::Throttled`
+    /// rather than sleeping for an unreasonable duration.
+    pub max_retry_delay: Duration,
+}
+
+impl RetryPolicy {
+    /// Creates a new `RetryPolicy` with the specified parameters.
+    pub fn new(max_retries: u32, max_retry_delay: Duration) -> Self {
+        RetryPolicy {
+            max_retries,
+            max_retry_delay,
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            max_retries: 3,
+            max_retry_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Extracts the `Retry-After` header value (in seconds) from an HTTP response.
+///
+/// The MDE API returns `Retry-After` as an integer number of seconds when
+/// throttling with 429. If the header is missing or unparseable, defaults
+/// to 5 seconds as a safe fallback — this avoids hammering the API in a
+/// tight loop while still making progress.
+fn parse_retry_after(resp: &reqwest::Response) -> u64 {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+}
+
 /// Builds a `reqwest::Client` with explicit timeouts for MDE API calls.
 ///
 /// Separating this from the `TokenProvider`'s client allows different
@@ -64,10 +125,13 @@ fn build_api_client() -> Client {
 ///   token check/refresh, never across an HTTP round-trip.
 /// - `base_url` is stored as a `String` rather than a `&'static str` so it
 ///   can be overridden in tests (e.g. pointing at a wiremock server).
+/// - `retry_policy` controls 429 throttle retry behavior independently of
+///   the always-on 401 token-refresh retry.
 pub struct MdeClient {
     client: Client,
     base_url: String,
     auth: Mutex<TokenProvider>,
+    retry_policy: RetryPolicy,
 }
 
 impl MdeClient {
@@ -86,6 +150,7 @@ impl MdeClient {
             client: build_api_client(),
             base_url: base_url.unwrap_or(DEFAULT_BASE_URL).to_string(),
             auth: Mutex::new(auth),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -99,7 +164,17 @@ impl MdeClient {
             client: build_api_client(),
             base_url: base_url.to_string(),
             auth: Mutex::new(auth),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Replaces the default retry policy with a custom one.
+    ///
+    /// Useful for tests that need aggressive retry settings (short delays)
+    /// or for production scenarios that need more patience (higher retry counts).
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Returns a valid bearer token, refreshing if none is cached or if the
@@ -140,20 +215,23 @@ impl MdeClient {
     }
 
     /// Core HTTP method: sends an authenticated JSON request and deserializes
-    /// the response. All verb-specific methods (`get`, `post`, `put`) delegate
-    /// here.
+    /// the response. All verb-specific methods (`get`, `post`, `put`, `patch`)
+    /// delegate here.
     ///
     /// `path` is relative to `base_url` (no leading slash needed).
     /// `body` is serialized as JSON when present; omitted for GET requests.
     ///
-    /// 401 retry behavior:
-    /// - If the response is `401 Unauthorized`, the client assumes the token
-    ///   was rejected server-side. It invalidates the cached token, acquires
-    ///   a fresh one, and retries the request exactly once.
-    /// - If the retry also returns a non-success status, the error propagates
-    ///   to the caller as `MdeError::Api` (preserving the response body).
-    /// - Non-401 error status codes (403, 404, 500, etc.) are never retried
-    ///   and propagate immediately as `MdeError::Api`.
+    /// Retry behavior (in priority order):
+    /// - **401 Unauthorized**: invalidates the cached token, acquires a fresh
+    ///   one from Azure AD, and retries exactly once. A second 401 propagates
+    ///   as `MdeError::Api`. This handles server-side token revocation that our
+    ///   local expiry tracking didn't catch.
+    /// - **429 Too Many Requests**: reads the `Retry-After` header, sleeps for
+    ///   that duration (capped by `RetryPolicy::max_retry_delay`), and retries
+    ///   up to `RetryPolicy::max_retries` times. If retries are exhausted or
+    ///   the delay exceeds the cap, returns `MdeError::Throttled`.
+    /// - All other error status codes (403, 404, 500, etc.) propagate
+    ///   immediately as `MdeError::Api` with the response body preserved.
     async fn send_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -161,29 +239,78 @@ impl MdeClient {
         body: Option<&B>,
     ) -> crate::error::Result<T> {
         let url = format!("{}{}", self.base_url, path);
+        let mut throttle_retries: u32 = 0;
 
-        // First attempt with current (possibly cached) token.
-        let token = self.bearer_token().await?;
-        let resp = self
-            .build_request(method.clone(), &url, &token, body)
-            .send()
-            .await
-            .map_err(MdeError::Network)?;
-
-        // On 401, force a token refresh and retry exactly once.
-        // Any other status (success or non-401 error) skips the retry path.
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            let fresh_token = self.force_refresh().await?;
-            let retry_resp = self
-                .build_request(method, &url, &fresh_token, body)
+        loop {
+            let token = self.bearer_token().await?;
+            let resp = self
+                .build_request(method.clone(), &url, &token, body)
                 .send()
                 .await
                 .map_err(MdeError::Network)?;
 
-            return self.parse_response(retry_resp).await;
+            let status = resp.status();
+
+            // 401 Unauthorized: force a token refresh and retry exactly once.
+            // If the retry response is still 401, we return the API error
+            // immediately. We only loop when the retry response is 429.
+            if status == StatusCode::UNAUTHORIZED {
+                let fresh_token = self.force_refresh().await?;
+                let retry_resp = self
+                    .build_request(method.clone(), &url, &fresh_token, body)
+                    .send()
+                    .await
+                    .map_err(MdeError::Network)?;
+
+                // If the 401 retry itself gets throttled (429), handle the
+                // throttle and continue the outer retry loop rather than
+                // returning — the next iteration will re-acquire the token
+                // and try again.
+                let retry_status = retry_resp.status();
+                if retry_status == StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after = parse_retry_after(&retry_resp);
+                    self.handle_throttle(retry_after, &mut throttle_retries)
+                        .await?;
+                    continue;
+                }
+
+                return self.parse_response(retry_resp).await;
+            }
+
+            // 429 Too Many Requests: honor Retry-After header and retry.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(&resp);
+                self.handle_throttle(retry_after, &mut throttle_retries)
+                    .await?;
+                continue;
+            }
+
+            return self.parse_response(resp).await;
+        }
+    }
+
+    /// Handles a 429 throttle response: validates retry budget, sleeps for
+    /// the requested duration, and either returns Ok(()) to continue the
+    /// retry loop or returns Err(Throttled) if retries are exhausted.
+    async fn handle_throttle(
+        &self,
+        retry_after_secs: u64,
+        throttle_retries: &mut u32,
+    ) -> crate::error::Result<()> {
+        // If the server's requested delay exceeds our cap, don't wait —
+        // fail immediately so the caller can decide what to do.
+        let delay = Duration::from_secs(retry_after_secs);
+        if delay > self.retry_policy.max_retry_delay {
+            return Err(MdeError::Throttled { retry_after_secs });
         }
 
-        self.parse_response(resp).await
+        *throttle_retries += 1;
+        if *throttle_retries > self.retry_policy.max_retries {
+            return Err(MdeError::Throttled { retry_after_secs });
+        }
+
+        tokio::time::sleep(delay).await;
+        Ok(())
     }
 
     /// Checks the HTTP status code and deserializes the JSON response body.
@@ -246,6 +373,138 @@ impl MdeClient {
         body: &B,
     ) -> crate::error::Result<T> {
         self.send_json(Method::PUT, path, Some(body)).await
+    }
+
+    /// Sends an authenticated PATCH request with a JSON body and deserializes
+    /// the response.
+    ///
+    /// Used for partial-update endpoints like alert updates
+    /// (`PATCH /api/alerts/{id}`), where only the fields present in the
+    /// request body are modified on the server.
+    pub async fn patch<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> crate::error::Result<T> {
+        self.send_json(Method::PATCH, path, Some(body)).await
+    }
+
+    /// Sends an authenticated request that expects no response body (204 No Content).
+    ///
+    /// Unlike `send_json`, this method does not attempt to deserialize the
+    /// response — it only checks the HTTP status code. Used for DELETE
+    /// endpoints like library file deletion and indicator deletion.
+    ///
+    /// Retry behavior is identical to `send_json`: one-shot 401 retry for
+    /// stale tokens, and 429 throttle retry per the configured `RetryPolicy`.
+    async fn send_no_content(&self, method: Method, path: &str) -> crate::error::Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut throttle_retries: u32 = 0;
+
+        loop {
+            let token = self.bearer_token().await?;
+            let resp = self
+                .build_request::<()>(method.clone(), &url, &token, None)
+                .send()
+                .await
+                .map_err(MdeError::Network)?;
+
+            let status = resp.status();
+
+            if status == StatusCode::UNAUTHORIZED {
+                let fresh_token = self.force_refresh().await?;
+                let retry_resp = self
+                    .build_request::<()>(method.clone(), &url, &fresh_token, None)
+                    .send()
+                    .await
+                    .map_err(MdeError::Network)?;
+
+                let retry_status = retry_resp.status();
+                if retry_status == StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after = parse_retry_after(&retry_resp);
+                    self.handle_throttle(retry_after, &mut throttle_retries)
+                        .await?;
+                    continue;
+                }
+
+                return self.parse_empty_response(retry_resp).await;
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(&resp);
+                self.handle_throttle(retry_after, &mut throttle_retries)
+                    .await?;
+                continue;
+            }
+
+            return self.parse_empty_response(resp).await;
+        }
+    }
+
+    /// Checks the HTTP status code for a response that should have no body.
+    ///
+    /// Returns `Ok(())` on any 2xx status (200, 204, etc.) or `MdeError::Api`
+    /// on error. Unlike `parse_response`, this does not attempt JSON
+    /// deserialization — the response body is only read on error for diagnostics.
+    async fn parse_empty_response(&self, resp: reqwest::Response) -> crate::error::Result<()> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MdeError::Api { status, body });
+        }
+        Ok(())
+    }
+
+    /// Sends an authenticated DELETE request that expects no response body.
+    ///
+    /// Returns `Ok(())` on success (typically 204 No Content). Used for
+    /// MDE endpoints like library file deletion (`DELETE /api/libraryfiles/{name}`)
+    /// and indicator deletion (`DELETE /api/indicators/{id}`).
+    pub async fn delete(&self, path: &str) -> crate::error::Result<()> {
+        self.send_no_content(Method::DELETE, path).await
+    }
+
+    /// Sends an authenticated multipart/form-data upload and deserializes
+    /// the JSON response.
+    ///
+    /// Used for the MDE library file upload endpoint
+    /// (`POST /api/libraryfiles`) which accepts multipart form data with
+    /// file content, description, and other metadata fields.
+    ///
+    /// **Important limitation**: `reqwest::multipart::Form` is consumed on
+    /// send and cannot be cloned. Therefore, this method does **not** perform
+    /// 401 retry or 429 retry — the form cannot be replayed. If the upload
+    /// is rejected with 401, the error propagates immediately and the
+    /// caller must rebuild the form and retry at the application level. This
+    /// is acceptable because file uploads are infrequent, user-initiated
+    /// operations where a simple retry is straightforward.
+    ///
+    /// For 429 responses, the method maps to `MdeError::Throttled` (using
+    /// the `Retry-After` value) but still does not perform automatic retry.
+    pub async fn upload_multipart<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> crate::error::Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let token = self.bearer_token().await?;
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(MdeError::Network)?;
+
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(MdeError::Throttled {
+                retry_after_secs: parse_retry_after(&resp),
+            });
+        }
+
+        self.parse_response(resp).await
     }
 
     /// Downloads raw bytes from an arbitrary URL without bearer auth.
@@ -514,6 +773,272 @@ mod tests {
         assert!(
             !download_req.headers.contains_key("Authorization"),
             "download() must not send an Authorization header to SAS URLs"
+        );
+    }
+
+    // ── PATCH tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn patch_sends_json_and_returns_deserialized_response() {
+        // PATCH is used for partial updates (e.g. alert status changes).
+        // Validates that the method sends JSON, receives JSON, and deserializes
+        // correctly — same contract as POST/PUT but with PATCH semantics.
+        let (server, client) = test_client().await;
+
+        Mock::given(method("PATCH"))
+            .and(path("/api/alerts/alert-123"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"value": "updated"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let body = serde_json::json!({"status": "Resolved"});
+        let result: TestPayload = client.patch("api/alerts/alert-123", &body).await.unwrap();
+        assert_eq!(result.value, "updated");
+    }
+
+    // ── DELETE tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_returns_ok_on_204() {
+        // DELETE endpoints like /api/libraryfiles/{name} return 204 No Content
+        // on success. The client must not attempt JSON deserialization on an
+        // empty response body — just return Ok(()).
+        let (server, client) = test_client().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/libraryfiles/script.ps1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client
+            .delete("api/libraryfiles/script.ps1")
+            .await
+            .expect("delete should succeed on 204 No Content");
+    }
+
+    #[tokio::test]
+    async fn delete_returns_api_error_on_404() {
+        // If the resource doesn't exist, the API returns 404. The client
+        // should return MdeError::Api with the status and body preserved.
+        let (server, client) = test_client().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/api/libraryfiles/nonexistent.ps1"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Resource not found"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = client
+            .delete("api/libraryfiles/nonexistent.ps1")
+            .await
+            .unwrap_err();
+
+        match &err {
+            MdeError::Api { status, body } => {
+                assert_eq!(*status, StatusCode::NOT_FOUND);
+                assert!(body.contains("not found"), "error body should be preserved");
+            }
+            other => panic!("expected MdeError::Api, got: {other:?}"),
+        }
+    }
+
+    // ── Multipart upload tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn upload_multipart_sends_form_and_returns_json() {
+        // Validates that upload_multipart sends a multipart form with bearer
+        // auth and correctly deserializes the JSON response. This mirrors the
+        // MDE library file upload flow (POST /api/libraryfiles).
+        let (server, client) = test_client().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/libraryfiles"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"value": "uploaded"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let form = reqwest::multipart::Form::new()
+            .text("Description", "test script")
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"script content".to_vec()).file_name("test.ps1"),
+            );
+
+        let result: TestPayload = client
+            .upload_multipart("api/libraryfiles", form)
+            .await
+            .unwrap();
+        assert_eq!(result.value, "uploaded");
+    }
+
+    #[tokio::test]
+    async fn upload_multipart_maps_429_to_throttled_without_retry() {
+        // Multipart forms are consumed on send and cannot be replayed.
+        // A 429 should still surface as MdeError::Throttled for consistency,
+        // but no automatic retry is attempted.
+        let (server, client) = test_client().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/libraryfiles"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "7")
+                    .set_body_string("Too Many Requests"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let form = reqwest::multipart::Form::new()
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"script content".to_vec()).file_name("test.ps1"),
+            );
+
+        let err = client
+            .upload_multipart::<TestPayload>("api/libraryfiles", form)
+            .await
+            .unwrap_err();
+        match err {
+            MdeError::Throttled { retry_after_secs } => assert_eq!(retry_after_secs, 7),
+            other => panic!("expected MdeError::Throttled, got: {other:?}"),
+        }
+    }
+
+    // ── 429 retry tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_json_retries_on_429_with_retry_after() {
+        // When the API returns 429 with a Retry-After header, the client
+        // should sleep for the specified duration and retry. This test uses
+        // a 0-second Retry-After to avoid slowing down the test suite.
+        let (server, client) = test_client().await;
+
+        // First request returns 429 with Retry-After: 0.
+        Mock::given(method("GET"))
+            .and(path("/api/throttled"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .set_body_string("Too Many Requests"),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .named("429 first attempt")
+            .mount(&server)
+            .await;
+
+        // Second request succeeds.
+        Mock::given(method("GET"))
+            .and(path("/api/throttled"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"value": "ok-after-retry"})),
+            )
+            .expect(1)
+            .named("200 after retry")
+            .mount(&server)
+            .await;
+
+        let result: TestPayload = client.get("api/throttled").await.unwrap();
+        assert_eq!(
+            result.value, "ok-after-retry",
+            "should return the response from the retry after 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_json_returns_throttled_after_max_retries() {
+        // When 429 persists beyond max_retries, the client gives up and
+        // returns MdeError::Throttled with the last Retry-After value.
+        let server = MockServer::start().await;
+        let tp = TokenProvider::with_token("test-bearer-token");
+        let client = MdeClient::with_base_url(tp, &format!("{}/", server.uri()))
+            .await
+            .with_retry_policy(RetryPolicy::new(2, Duration::from_secs(60)));
+
+        // All requests return 429 — never succeeds.
+        Mock::given(method("GET"))
+            .and(path("/api/always-throttled"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "0")
+                    .set_body_string("Too Many Requests"),
+            )
+            .named("persistent 429")
+            .mount(&server)
+            .await;
+
+        let result: crate::error::Result<TestPayload> = client.get("api/always-throttled").await;
+        let err = result.unwrap_err();
+
+        match &err {
+            MdeError::Throttled { retry_after_secs } => {
+                assert_eq!(
+                    *retry_after_secs, 0,
+                    "should preserve the last Retry-After value"
+                );
+            }
+            other => panic!("expected MdeError::Throttled, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_json_returns_throttled_when_retry_after_exceeds_max_delay() {
+        // If the server requests a delay longer than max_retry_delay, the
+        // client fails immediately rather than sleeping for an unreasonable
+        // duration. This prevents a single request from blocking for minutes.
+        let server = MockServer::start().await;
+        let tp = TokenProvider::with_token("test-bearer-token");
+        let client = MdeClient::with_base_url(tp, &format!("{}/", server.uri()))
+            .await
+            .with_retry_policy(RetryPolicy::new(3, Duration::from_secs(5)));
+
+        Mock::given(method("GET"))
+            .and(path("/api/slow-throttle"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "120")
+                    .set_body_string("Too Many Requests"),
+            )
+            .expect(1)
+            .named("429 with large Retry-After")
+            .mount(&server)
+            .await;
+
+        let result: crate::error::Result<TestPayload> = client.get("api/slow-throttle").await;
+        let err = result.unwrap_err();
+
+        match &err {
+            MdeError::Throttled { retry_after_secs } => {
+                assert_eq!(
+                    *retry_after_secs, 120,
+                    "should preserve the server's requested delay"
+                );
+            }
+            other => panic!("expected MdeError::Throttled, got: {other:?}"),
+        }
+    }
+
+    // ── RetryPolicy tests ────────────────────────────────────────────
+
+    #[test]
+    fn retry_policy_default_values() {
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_retries, 3, "default max_retries should be 3");
+        assert_eq!(
+            policy.max_retry_delay,
+            Duration::from_secs(60),
+            "default max_retry_delay should be 60s"
         );
     }
 }

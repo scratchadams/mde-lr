@@ -2,7 +2,7 @@
 
 Status: Draft
 Owner: mde-lr maintainers
-Last updated: 2026-02-15
+Last updated: 2026-02-16
 
 ## 1. Purpose and Scope
 
@@ -11,8 +11,11 @@ runtime flow, failure semantics, and key design choices.
 
 `mde-lr` is an async Rust CLI that executes Microsoft Defender for Endpoint
 (MDE) Live Response actions against a target device. The implemented CLI path
-today is `GetFile`; the core orchestration is generic enough to support
-`RunScript` and multi-command sessions.
+today supports `GetFile`, `RunScript`, and `PutFile` actions.
+
+Observability is treated as a first-class engineering value for the next
+expansion phase: failures should be diagnosable with structured context from
+both runtime behavior and test artifacts.
 
 **Toolchain requirement:** The project uses `edition = "2024"` (set in
 `Cargo.toml`) and is pinned to **Rust 1.88.0** via `rust-toolchain.toml` with
@@ -66,6 +69,9 @@ is no parallelism across steps.
 | SAS download must not attach bearer auth | SAS URL already carries authorization via query-string token | `MdeClient::download` |
 | Token endpoint uses form-encoded bodies, not JSON | Azure AD `/oauth2/v2.0/token` requires `application/x-www-form-urlencoded` | `src/auth.rs` (`reqwest::RequestBuilder::form()` serializes via `serde_urlencoded`) |
 | Public API surface returns fallible async results | Explicit failure handling across network boundaries | `Result<T, MdeError>` typed error hierarchy |
+| Failure diagnostics must include actionable context | External API failures require fast root-cause isolation | `MdeError` preserves status/body; tests assert failure-path behavior |
+| 429 throttle must be retried with backoff | MDE API enforces per-endpoint rate limits (100 calls/min) | `src/client.rs` (`send_json`, `send_no_content`) honor `Retry-After` header up to `RetryPolicy::max_retries` |
+| Multipart uploads are not retried | `reqwest::multipart::Form` is consumed on send (not `Clone`) | `src/client.rs` (`upload_multipart`) — callers retry at the application level |
 
 ## 4. Module Architecture
 
@@ -329,6 +335,8 @@ error. This provides forward compatibility if Microsoft adds new status values.
 | `-g` + `--file` | GetFile action | Collect a file from the remote device; `--file` is validated at runtime |
 | `-r` + `--script` [+ `--args`] | RunScript action | Execute a PowerShell script on the remote device; `--script` is validated at runtime, `--args` is optional and allows hyphen-prefixed values |
 | `-p` + `--file` | PutFile action | Upload a file from the MDE library to the remote device; `--file` is validated at runtime |
+| `-t` | Token inspection | Acquire an OAuth2 token and print it to stdout; does not require `--device-id` |
+| `--out` | Output file path | Save downloaded result bytes to disk; for multi-command results, index suffixes are added (e.g. `out_0.zip`, `out_1.zip`) |
 | `--config`, `--query` | Future placeholders | Parsed but currently unused |
 
 **Exit codes:**
@@ -336,9 +344,9 @@ error. This provides forward compatibility if Microsoft adds new status values.
 - `1`: runtime error (auth failure, API error, timeout, etc.)
 - `2`: argument validation error (clap handles this automatically)
 
-**Action flag constraint:** Exactly one of `-g`, `-r`, `-p` must be set per
-invocation. This is enforced at parse time by clap's `#[group(required = true,
-multiple = false)]` attribute on `ActionFlags`.
+**Action flag constraint:** Exactly one of `-g`, `-r`, `-p`, `-t` must be set
+per invocation. This is enforced at parse time by clap's `#[group(required =
+true, multiple = false)]` attribute on `ActionFlags`.
 
 **RunScript output handling:** When `-r` is used, the CLI automatically parses
 the downloaded bytes as `ScriptResult` JSON and displays the script name, exit
@@ -359,6 +367,8 @@ CLI falls back to displaying the raw byte count.
 | Polling exceeds timeout | Return error including timeout duration + action id | N/A (timeout error) |
 | SAS download fails | `MdeError::Api` with status + body, or `MdeError::Network` | Yes — body preserved for HTTP errors |
 | Unknown action status during polling | Keep polling until terminal status or timeout | N/A (non-terminal) |
+| API returns 429 (throttled) | Read `Retry-After` header, sleep, retry up to `max_retries` times | Yes — body preserved if retries exhausted |
+| 429 with `Retry-After` exceeding `max_retry_delay` | Immediate `MdeError::Throttled` (no sleep) | N/A (policy limit) |
 | Network error (DNS, TCP, TLS) | Return reqwest transport error | N/A (no response) |
 
 ### 8.2 Error Flow Diagram
@@ -374,12 +384,19 @@ HTTP Response from MDE API
     │                           │
     │                           ├── 2xx ──────> Ok(T)
     │                           ├── 401 (2nd) ─> Err (MdeError::Api, body preserved)
+    │                           ├── 429 ──────> fall through to 429 handling below
     │                           └── other ─────> Err (MdeError::Api, body preserved)
     │
-    ├── 4xx/5xx (non-401) ─> Err via MdeError::Api { status, body }
-    │                        (response body is preserved for diagnostics)
+    ├── 429 ─────────────────> read Retry-After header
+    │                          if delay > max_retry_delay: Err (MdeError::Throttled)
+    │                          sleep(delay), increment retry count
+    │                          if retries > max_retries: Err (MdeError::Throttled)
+    │                          retry request (loops back to top)
     │
-    └── network error ─────> Err (MdeError::Network wrapping reqwest::Error)
+    ├── 4xx/5xx (non-401/429) ─> Err via MdeError::Api { status, body }
+    │                            (response body is preserved for diagnostics)
+    │
+    └── network error ─────────> Err (MdeError::Network wrapping reqwest::Error)
 ```
 
 ## 9. Configuration and Defaults
@@ -393,6 +410,8 @@ HTTP Response from MDE API
 | Token expiry safety buffer | `EXPIRY_BUFFER_SECS` | 60s | Prevents edge-of-expiry request failures |
 | Poll interval | `PollConfig::default().interval` | 5s | Balances responsiveness against API rate limits |
 | Poll timeout | `PollConfig::default().timeout` | 600s (10 min) | Covers long-running scripts; prevents infinite hangs |
+| Throttle max retries | `RetryPolicy::default().max_retries` | 3 | Most transient throttling resolves in 1-2 retries |
+| Throttle max delay | `RetryPolicy::default().max_retry_delay` | 60s | Prevents a single request from blocking for minutes |
 
 **Why separate timeout profiles?** Token requests and API requests have very
 different payload sizes and server-side processing times. Token requests are
@@ -408,11 +427,12 @@ lenient for token failures.
 | Test layer | Scope | Notable assertions |
 |---|---|---|
 | Unit tests in `src/auth.rs` (11 tests) | Token URL construction, serde, cache expiry/buffer logic | Token invalid before refresh, expiry is deterministic, buffer boundary behavior |
-| Unit tests in `src/client.rs` (5 tests) | HTTP methods, 401 retry, error body preservation, SAS download auth | One-shot retry succeeds/fails, 403 body preserved, no bearer on SAS URLs |
-| Unit tests in `src/error.rs` (7 tests) | Error display, source chaining, Send+Sync | All variants display correctly, source chain traversable |
+| Unit tests in `src/client.rs` (12 tests) | HTTP methods (GET/POST/PUT/PATCH/DELETE), 401 retry, 429 throttle retry, error body preservation, SAS download, multipart upload | One-shot 401 retry, 429 retry with Retry-After, retry exhaustion, max delay cap, PATCH/DELETE/multipart happy paths |
+| Unit tests in `src/error.rs` (8 tests) | Error display, source chaining, Send+Sync, Throttled variant | All variants display correctly, source chain traversable, Throttled displays retry-after |
 | Unit tests in `src/live_response.rs` (10 tests) | API model serde, unknown status handling, poll defaults, request round-trips | Forward-compatible enum parsing, PascalCase serialization, PutFile variant |
-| Unit tests in `src/main.rs` (9 tests) | CLI argument parsing for all three actions | Action flag enforcement, parameter validation, conflicting flags rejected |
+| Unit tests in `src/main.rs` (17 tests) | CLI argument parsing for all actions, output path indexing | Action flag enforcement, parameter validation, conflicting flags rejected, --out parsing, path index logic |
 | Integration tests in `tests/live_response_flow.rs` (7 tests) | Full 4-step wiremock flow | End-to-end bytes returned, RunScript parse path, failed/cancelled actions, polling timeout, multi-step progression, multi-command indexing |
+| Integration tests in `tests/manifest_validation.rs` (3 tests) | Endpoint manifest TOML validation | Schema structure, implemented endpoints, valid HTTP verbs |
 
 ### 10.2 How the Mock Server Works
 
@@ -450,26 +470,56 @@ in-process HTTP server, with no network calls to real Azure services.
 | D-001 | `MdeClient` owns `tokio::sync::Mutex<TokenProvider>` (not `std::sync::Mutex`) | `tokio::sync::Mutex` can be held across `.await` points. Needed because `refresh_token()` is async. `std::sync::Mutex` would panic or deadlock if held across an await. | `src/client.rs` |
 | D-002 | Mutex lock is released before HTTP calls | The lock is acquired to check/refresh the token, the token string is cloned out, and the lock is dropped. This prevents the mutex from serializing all concurrent API calls behind a single lock. | `src/client.rs` (`bearer_token`, `force_refresh`) |
 | D-003 | `send_json<T, B>` generic request helper | Keeps method-specific wrappers (`get`, `post`, `put`) thin and consistent. Single place to implement retry logic. | `src/client.rs` |
-| D-004 | One-shot retry only on 401 | Handles revoked/stale tokens without risking retry loops. Non-401 errors are never retried because they indicate a real problem (bad request, server error), not a stale credential. | `src/client.rs` |
+| D-004 | One-shot retry on 401, bounded retry on 429 | 401 handles revoked/stale tokens (one retry). 429 honors `Retry-After` header up to `RetryPolicy::max_retries` (default 3). Both compose: a 401 retry can itself hit 429. Non-401/429 errors propagate immediately. | `src/client.rs` |
 | D-005 | `ActionStatus::Unknown` enum variant with `#[serde(other)]` | Avoids hard deserialization failures if Microsoft adds new status values. Unknown is treated as non-terminal during polling. | `src/live_response.rs` |
 | D-006 | Separate token/API timeout profiles | Token requests are small/fast; result downloads may be large. A single timeout can't serve both well. | `src/auth.rs`, `src/client.rs` |
 | D-007 | `run_live_response` is a free function, not a method on `MdeClient` | Keeps orchestration logic separate from the HTTP client. The client is a reusable transport layer; orchestration is a higher-level concern. This supports future API families without bloating `MdeClient`. | `src/live_response.rs` |
 | D-008 | `with_token` + `with_base_url` test constructors | Enable deterministic tests without real cloud dependencies. Separate from production constructors to avoid polluting the public API. | `src/auth.rs`, `src/client.rs` |
+| D-009 | `RetryPolicy` is a separate configurable struct, not hardcoded | Different callers need different retry budgets. Tests use aggressive settings (0s delay); production defaults to 3 retries with 60s cap. | `src/client.rs` |
+| D-010 | `send_no_content` parallel to `send_json` for 204 responses | DELETE and some POST endpoints return empty bodies. Attempting JSON deserialization on 204 would fail. Separate method avoids conditional logic in `parse_response`. | `src/client.rs` |
+| D-011 | Multipart uploads skip 401/429 retry | `reqwest::multipart::Form` is consumed on send (not `Clone`). Buffering form parts for replay adds complexity with little benefit since uploads are infrequent, user-initiated operations. | `src/client.rs` |
+| D-012 | Endpoint manifest as TOML, validated in CI | Tracks API coverage as structured data rather than prose. CI test catches syntax errors and missing fields. Manifest is the foundation for future codegen. | `manifest/endpoints.toml`, `tests/manifest_validation.rs` |
 
-## 12. Current Gaps and Next Architectural Steps
+## 12. Codegen Boundary
+
+The endpoint manifest (`manifest/endpoints.toml`) establishes the boundary between
+handwritten and generated code. As of Milestone 0, no code is generated — the
+manifest is read-only metadata validated in CI.
+
+| Layer | Approach | Rationale |
+|-------|----------|-----------|
+| Auth, transport, error types | Handwritten (always) | Complex control flow (retry, mutex, expiry) that benefits from explicit implementation |
+| Retry logic (401, 429) | Handwritten (always) | State-dependent behavior with composition (401 can trigger 429) |
+| Orchestration (polling, multi-step flows) | Handwritten (always) | Domain-specific logic that varies per endpoint family |
+| CLI argument parsing | Handwritten (always) | User-facing surface that benefits from careful documentation |
+| Endpoint inventory, permissions | Manifest-driven (now) | Structured data that should be validated and tracked systematically |
+| Coverage tracking | Manifest-driven (now) | `implemented` flag in manifest drives CI reports |
+| Endpoint function stubs | Generated (future, M1+) | Repetitive boilerplate (URL construction, type aliases) once patterns stabilize |
+| Request/response type scaffolds | Generated (future, M1+) | Can be derived from manifest once enough families are implemented by hand |
+
+The generation boundary will shift as more endpoint families are implemented. The
+guiding principle: implement at least two families by hand before extracting
+patterns into generated code. This ensures the abstractions match real usage, not
+hypothetical shapes.
+
+## 13. Current Gaps and Next Architectural Steps
 
 | Gap | Impact | Suggested direction |
 |---|---|---|
 | No structured logging/tracing | Harder production debugging of polling and retries | Add `tracing` spans around auth, poll loop, and downloads |
-| Results are fully buffered in memory | Large downloads increase memory pressure | Add optional streaming write-to-disk path |
+| Results are fully buffered in memory before writing to disk | Large downloads increase memory pressure | Add optional streaming write-to-disk path (currently `--out` writes after full buffering) |
 | Workspace split | Single crate serves both CLI and library consumers | Split into `mde-lr` (CLI binary) and `mde-lr-lib` (library crate) when a second consumer emerges |
 
-Resolved gaps (completed in Phases 1-4):
+Resolved gaps (completed in Phases 1-4 and Milestone 0):
 - Typed `MdeError` enum with source chaining (Phase 2a)
 - Configurable cloud endpoints for sovereign clouds (Phase 2b)
 - `#![warn(missing_docs)]` enabled (Phase 2c)
 - 401 retry integration tests with wiremock (Phase 3b)
 - All three Live Response actions implemented: GetFile, RunScript, PutFile (Phase 4)
+- Full HTTP verb coverage: PATCH, DELETE, multipart upload (M0)
+- 204 No Content handling for delete endpoints (M0)
+- 429 throttle retry with configurable `RetryPolicy` and `Retry-After` header (M0)
+- Endpoint manifest with CI validation (M0)
 
 ## 13. Inspiration Notes
 

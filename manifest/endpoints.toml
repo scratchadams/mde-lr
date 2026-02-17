@@ -1,0 +1,322 @@
+# MDE API Endpoint Manifest
+#
+# This file inventories known Microsoft Defender for Endpoint API endpoints
+# along with their HTTP methods, content types, expected response codes,
+# required permissions, and implementation status within the mde-lr crate.
+#
+# Purpose:
+# - Track which endpoints are implemented vs planned.
+# - Validate manifest structure in CI (syntactic correctness).
+# - Serve as the source of truth for future codegen (Milestone 1+).
+#
+# Schema version changes require updating the manifest validation test
+# in tests/manifest_validation.rs.
+
+[meta]
+schema_version = 1
+last_validated = "2026-02-16"
+
+# ── Live Response ────────────────────────────────────────────────────
+
+[[endpoints]]
+family = "live_response"
+name = "run_live_response"
+method = "POST"
+path = "/api/machines/{machine_id}/runliveresponse"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Machine.LiveResponse"]
+implemented = true
+notes = "4-step async flow: POST → poll → download link → SAS download"
+
+[[endpoints]]
+family = "live_response"
+name = "get_machine_action"
+method = "GET"
+path = "/api/machineactions/{action_id}"
+request_content_type = ""
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = true
+notes = "Used for polling action status until terminal state"
+
+[[endpoints]]
+family = "live_response"
+name = "get_live_response_result_download_link"
+method = "GET"
+path = "/api/machineactions/{action_id}/GetLiveResponseResultDownloadLink(index={index})"
+request_content_type = ""
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = true
+notes = "Returns time-limited Azure Blob SAS URL (30 min expiry)"
+
+[[endpoints]]
+family = "live_response"
+name = "download_sas_result"
+method = "GET"
+path = "{sas_url}"
+request_content_type = ""
+response_status = 200
+permissions = []
+implemented = true
+notes = "Unauthenticated download (SAS token in query string, no bearer)"
+
+# ── Library Management ───────────────────────────────────────────────
+
+[[endpoints]]
+family = "library"
+name = "upload_library_file"
+method = "POST"
+path = "/api/libraryfiles"
+request_content_type = "multipart/form-data"
+response_status = 200
+permissions = ["Library.Manage"]
+implemented = false
+notes = "Multipart upload: file + Description + OverrideIfExists. Max 20 MB."
+
+[[endpoints]]
+family = "library"
+name = "list_library_files"
+method = "GET"
+path = "/api/libraryfiles"
+request_content_type = ""
+response_status = 200
+permissions = ["Library.Manage"]
+implemented = false
+
+[[endpoints]]
+family = "library"
+name = "delete_library_file"
+method = "DELETE"
+path = "/api/libraryfiles/{file_name}"
+request_content_type = ""
+response_status = 204
+permissions = ["Library.Manage"]
+implemented = false
+notes = "Returns 204 No Content on success"
+
+# ── Machine Actions ──────────────────────────────────────────────────
+
+[[endpoints]]
+family = "machine_actions"
+name = "list_machine_actions"
+method = "GET"
+path = "/api/machineactions"
+request_content_type = ""
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "isolate_machine"
+method = "POST"
+path = "/api/machines/{machine_id}/isolate"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.Isolate"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "unisolate_machine"
+method = "POST"
+path = "/api/machines/{machine_id}/unisolate"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.Isolate"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "run_antivirus_scan"
+method = "POST"
+path = "/api/machines/{machine_id}/runAntiVirusScan"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.Scan"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "collect_investigation_package"
+method = "POST"
+path = "/api/machines/{machine_id}/collectInvestigationPackage"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.CollectForensics"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "stop_and_quarantine_file"
+method = "POST"
+path = "/api/machines/{machine_id}/StopAndQuarantineFile"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.StopAndQuarantine"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "restrict_code_execution"
+method = "POST"
+path = "/api/machines/{machine_id}/restrictCodeExecution"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.RestrictExecution"]
+implemented = false
+
+[[endpoints]]
+family = "machine_actions"
+name = "unrestrict_code_execution"
+method = "POST"
+path = "/api/machines/{machine_id}/unrestrictCodeExecution"
+request_content_type = "application/json"
+response_status = 201
+permissions = ["Machine.RestrictExecution"]
+implemented = false
+
+# ── Machines ─────────────────────────────────────────────────────────
+
+[[endpoints]]
+family = "machines"
+name = "list_machines"
+method = "GET"
+path = "/api/machines"
+request_content_type = ""
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "machines"
+name = "get_machine"
+method = "GET"
+path = "/api/machines/{machine_id}"
+request_content_type = ""
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "machines"
+name = "update_machine"
+method = "PATCH"
+path = "/api/machines/{machine_id}"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Machine.ReadWrite.All"]
+implemented = false
+
+# ── Alerts ───────────────────────────────────────────────────────────
+
+[[endpoints]]
+family = "alerts"
+name = "list_alerts"
+method = "GET"
+path = "/api/alerts"
+request_content_type = ""
+response_status = 200
+permissions = ["Alert.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "alerts"
+name = "get_alert"
+method = "GET"
+path = "/api/alerts/{alert_id}"
+request_content_type = ""
+response_status = 200
+permissions = ["Alert.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "alerts"
+name = "update_alert"
+method = "PATCH"
+path = "/api/alerts/{alert_id}"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Alerts.ReadWrite.All"]
+implemented = false
+notes = "Updatable fields: status, determination, classification, assignedTo, comment"
+
+[[endpoints]]
+family = "alerts"
+name = "batch_update_alerts"
+method = "PATCH"
+path = "/api/alerts/batchUpdate"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Alerts.ReadWrite.All"]
+implemented = false
+
+# ── Indicators ───────────────────────────────────────────────────────
+
+[[endpoints]]
+family = "indicators"
+name = "submit_indicator"
+method = "POST"
+path = "/api/indicators"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Ti.ReadWrite.All"]
+implemented = false
+notes = "Upsert: creates or updates based on indicatorValue"
+
+[[endpoints]]
+family = "indicators"
+name = "list_indicators"
+method = "GET"
+path = "/api/indicators"
+request_content_type = ""
+response_status = 200
+permissions = ["Ti.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "indicators"
+name = "get_indicator"
+method = "GET"
+path = "/api/indicators/{indicator_id}"
+request_content_type = ""
+response_status = 200
+permissions = ["Ti.ReadWrite.All"]
+implemented = false
+
+[[endpoints]]
+family = "indicators"
+name = "delete_indicator"
+method = "DELETE"
+path = "/api/indicators/{indicator_id}"
+request_content_type = ""
+response_status = 204
+permissions = ["Ti.ReadWrite.All"]
+implemented = false
+notes = "Returns 204 No Content on success"
+
+[[endpoints]]
+family = "indicators"
+name = "batch_delete_indicators"
+method = "POST"
+path = "/api/indicators/batchDelete"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["Ti.ReadWrite.All"]
+implemented = false
+notes = "Rate limit: 30 calls/min (stricter than standard 100/min)"
+
+# ── Advanced Hunting ─────────────────────────────────────────────────
+
+[[endpoints]]
+family = "hunting"
+name = "run_advanced_hunting_query"
+method = "POST"
+path = "/api/advancedhunting/run"
+request_content_type = "application/json"
+response_status = 200
+permissions = ["AdvancedQuery.Read.All"]
+implemented = false
+notes = "Rate limit: 45 calls/min, 10 min CPU/hr"

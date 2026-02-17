@@ -41,8 +41,11 @@ mde-lr \
   --tenant-id <AZURE_TENANT_ID> \
   --client-id <AZURE_CLIENT_ID> \
   --secret <CLIENT_SECRET> \
-  -g --file "C:\Windows\TEMP\evidence.zip"
+  -g --file "C:\Windows\TEMP\evidence.zip" \
+  --out ./evidence.zip
 ```
+
+The `--out` flag specifies where to save the downloaded file. Without it, the CLI reports the byte count but discards the data.
 
 ### Execute a Script on a Remote Device
 
@@ -106,6 +109,7 @@ The `--secret` flag reads from `MDE_CLIENT_SECRET` automatically when not provid
 | `--file` | When using `-g` or `-p` | Remote file path to collect or upload |
 | `--script` | When using `-r` | Name of the script to execute (must exist in MDE library) |
 | `--args` | No | Arguments to pass to the script (supports hyphen-prefixed values) |
+| `--out` | No (recommended for `-g`) | Output file path for saving downloaded results to disk |
 
 ### Exit Codes
 
@@ -244,6 +248,8 @@ async fn main() -> Result<(), MdeError> {
 | Token request fails | Error includes HTTP status and raw Azure AD error body (AADSTS codes) |
 | API returns 401 | Token is invalidated, refreshed, and the request is retried once |
 | API returns 401 a second time | Hard error — no further retries |
+| API returns 429 (throttled) | Reads `Retry-After` header, retries up to 3 times (configurable) |
+| API returns 429 beyond retry budget | `MdeError::Throttled` with the requested delay |
 | API returns other 4xx/5xx | Immediate error (no retry) |
 | Action status is `Failed` or `Cancelled` | Error includes the status and action ID |
 | Polling exceeds timeout | Error includes the timeout duration and action ID |
@@ -257,7 +263,7 @@ async fn main() -> Result<(), MdeError> {
 # Build
 cargo build
 
-# Run all tests (43 unit + 7 integration)
+# Run all tests (60 unit + 10 integration)
 cargo test
 
 # Run a specific test
@@ -285,12 +291,13 @@ All four steps of the live response flow execute without any real network calls.
 | Crate | Purpose |
 |---|---|
 | `clap` (derive, env) | CLI argument parsing with env var support |
-| `reqwest` (json, form) | Async HTTP client for API and token requests |
+| `reqwest` (json, form, multipart) | Async HTTP client for API, token, and file upload requests |
 | `serde` / `serde_json` | JSON serialization with PascalCase field renaming |
 | `serde_urlencoded` | Form-encoded serialization for OAuth2 token requests |
 | `thiserror` | Typed error derivation with source chaining |
 | `tokio` (full) | Async runtime |
 | `bytes` | Zero-copy byte buffer for download results |
+| `toml` (dev) | TOML deserialization for manifest validation tests |
 | `wiremock` (dev) | HTTP mock server for integration tests |
 
 ## Roadmap
@@ -316,18 +323,30 @@ The project follows a phased plan. Phases 1-4 are complete:
 **Phase 3** (quality gates):
 - [x] CI workflow (fmt, clippy, test, doc)
 - [x] Integration tests for 401 retry and polling timeout paths
-- [x] Expanded test coverage (50 total: 43 unit + 7 integration)
+- [x] Expanded test coverage
 
 **Phase 4** (CLI feature expansion):
 - [x] RunScript CLI action (`-r --script --args`)
 - [x] PutFile CLI action (`-p --file`)
+- [x] Token inspection flag (`-t`)
+- [x] `--out` flag for saving downloaded results to disk
 - [x] Structured script result output (exit code, stdout, stderr)
 - [x] Documentation updates across all project files
 
-Planned next:
+**Milestone 0** (foundation for expansion):
+- [x] PATCH, DELETE, multipart upload client methods
+- [x] 204 No Content handling for delete endpoints
+- [x] 429 throttle retry with configurable `RetryPolicy` and `Retry-After` header
+- [x] `MdeError::Throttled` error variant
+- [x] Endpoint manifest (`manifest/endpoints.toml`) with CI schema/structural validation
+- [x] Codegen boundary definition in architecture docs
+- [x] Test coverage: 70 total (60 unit + 10 integration)
 
+Planned next (see [roadmap.md](roadmap.md)):
+
+- [ ] Milestone 1: Core incident response API families (isolate, scan, investigation package)
 - [ ] Structured logging/tracing (`tracing` crate)
-- [ ] Streaming write-to-disk for large file downloads
+- [ ] Streaming write-to-disk for large file downloads (currently buffered in memory)
 - [ ] Workspace split (separate library/CLI crates) when a second consumer emerges
 
 See [architecture.md](architecture.md) for detailed design documentation including state diagrams, sequence diagrams, and decision records.

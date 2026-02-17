@@ -17,8 +17,9 @@ and scalable to larger scope.
   use cases without over‑engineering.
 - **Leave the codebase better than you found it.** Small improvements in
   structure, tests, or docs are additive.
-- **Debuggability is first-class.** Prefer designs that expose state, enable
-  tracing, and support inspection without invasive changes.
+- **Debuggability and observability are first-class.** Prefer designs that
+  expose state, enable tracing, and support inspection without invasive
+  changes.
 
 ---
 
@@ -106,6 +107,8 @@ and scalable to larger scope.
 - Are new behaviors documented and tested?
 - Is the failure behavior explicit and safe?
 - Can the system be inspected/debugged without ad-hoc instrumentation?
+- Are failures and retries easy to trace with actionable context (for example:
+  endpoint, action ID, status code, and timeout path)?
 - Can a new engineer understand the change without tribal context?
 
 If all answers are “yes,” the change is ready to ship.

@@ -12,7 +12,7 @@ license = "MIT"
 [dependencies]
 bytes = "1"
 clap = { version = "4.5.58", features = ["derive", "env"] }
-reqwest = { version = "0.13.2", features = ["json", "form"] }
+reqwest = { version = "0.13.2", features = ["json", "form", "multipart"] }
 serde = { version = "1.0.228", features = ["derive"]}
 serde_json = "1.0"
 serde_urlencoded = "0.7"
@@ -20,4 +20,5 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 
 [dev-dependencies]
+toml = "0.8"
 wiremock = "0.6"
