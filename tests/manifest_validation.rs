@@ -74,10 +74,10 @@ fn manifest_endpoints_toml_is_valid() {
 }
 
 #[test]
-fn manifest_has_implemented_live_response_endpoints() {
-    // Verify that the four implemented Live Response endpoints are marked
-    // as implemented = true. This catches accidental regressions where
-    // someone edits the manifest and flips a flag.
+fn manifest_has_implemented_endpoints() {
+    // Verify that all implemented endpoints are correctly marked in the
+    // manifest. This catches accidental regressions where someone edits
+    // the manifest and flips a flag.
     let content = std::fs::read_to_string("manifest/endpoints.toml")
         .expect("manifest/endpoints.toml should exist");
 
@@ -90,18 +90,31 @@ fn manifest_has_implemented_live_response_endpoints() {
         .collect();
 
     assert!(
-        implemented.len() >= 4,
-        "at least 4 Live Response endpoints should be marked as implemented, found {}",
+        implemented.len() >= 14,
+        "at least 14 endpoints should be marked as implemented (4 live_response + 3 machines + 7 machine_actions), found {}",
         implemented.len()
     );
 
     // Check specific endpoint names are present and implemented.
     let implemented_names: Vec<&str> = implemented.iter().map(|ep| ep.name.as_str()).collect();
     for expected in [
+        // Live Response family (4 endpoints)
         "run_live_response",
         "get_machine_action",
         "get_live_response_result_download_link",
         "download_sas_result",
+        // Machines family (3 endpoints)
+        "list_machines",
+        "get_machine",
+        "update_machine",
+        // Machine Actions family (7 endpoints)
+        "isolate_machine",
+        "unisolate_machine",
+        "run_antivirus_scan",
+        "collect_investigation_package",
+        "stop_and_quarantine_file",
+        "restrict_code_execution",
+        "unrestrict_code_execution",
     ] {
         assert!(
             implemented_names.contains(&expected),

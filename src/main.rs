@@ -18,6 +18,8 @@ use mde_lr::client::MdeClient;
 use mde_lr::live_response::{
     Command, CommandType, LiveResponseRequest, Param, ScriptResult, run_live_response,
 };
+use mde_lr::machine_actions;
+use mde_lr::machines;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -71,6 +73,31 @@ struct Cli {
     #[arg(long)]
     query: Option<bool>,
 
+    /// Audit comment attached to machine actions (isolate, scan, etc.).
+    /// Defaults to "Action via mde-lr CLI" if not provided.
+    #[arg(long)]
+    comment: Option<String>,
+
+    /// Isolation type: "Full", "Selective", or "UnManagedDevice".
+    /// Only used with --isolate. Defaults to "Full".
+    #[arg(long, default_value = "Full")]
+    isolation_type: String,
+
+    /// AV scan type: "Quick" or "Full".
+    /// Only used with --scan. Defaults to "Quick".
+    #[arg(long, default_value = "Quick")]
+    scan_type: String,
+
+    /// SHA-1 hash of a file to stop and quarantine.
+    /// Required when using --stop-quarantine.
+    #[arg(long)]
+    sha1: Option<String>,
+
+    /// OData $filter expression for --list-machines.
+    /// Example: "healthStatus eq 'Active'"
+    #[arg(long)]
+    filter: Option<String>,
+
     #[command(flatten)]
     actions: ActionFlags,
 }
@@ -102,6 +129,48 @@ struct ActionFlags {
     /// verifying credentials, and inspecting token claims via jwt.ms or jwt.io.
     #[arg(short)]
     token: bool,
+
+    /// Isolate a device from the network. Use --isolation-type to control
+    /// the isolation mode (defaults to "Full"). Requires --device-id.
+    #[arg(long)]
+    isolate: bool,
+
+    /// Release a device from network isolation. Requires --device-id.
+    #[arg(long)]
+    unisolate: bool,
+
+    /// Run a Microsoft Defender Antivirus scan on a device. Use --scan-type
+    /// to choose "Quick" or "Full" (defaults to "Quick"). Requires --device-id.
+    #[arg(long)]
+    scan: bool,
+
+    /// Collect a forensic investigation package from a device. Requires --device-id.
+    #[arg(long)]
+    collect_investigation: bool,
+
+    /// Stop execution of a file and quarantine it on a device.
+    /// Requires --device-id and --sha1. Requires --device-id.
+    #[arg(long)]
+    stop_quarantine: bool,
+
+    /// Restrict application execution on a device (only Microsoft-signed apps allowed).
+    /// Requires --device-id.
+    #[arg(long)]
+    restrict_execution: bool,
+
+    /// Remove application execution restrictions from a device. Requires --device-id.
+    #[arg(long)]
+    unrestrict_execution: bool,
+
+    /// Retrieve information about a single device by ID.
+    /// Requires --device-id. Prints JSON to stdout.
+    #[arg(long)]
+    get_machine: bool,
+
+    /// List devices visible to the tenant. Use --filter for OData filtering.
+    /// Does not require --device-id. Prints JSON to stdout.
+    #[arg(long)]
+    list_machines: bool,
 }
 
 /// Computes the output file path for a given command index.
@@ -125,6 +194,34 @@ fn output_path_for_index(base: &std::path::Path, index: usize, total: usize) -> 
         None => format!("{stem}_{index}"),
     };
     base.with_file_name(indexed_name)
+}
+
+/// Prints a machine action result to stdout and returns the appropriate exit code.
+///
+/// Machine action endpoints (isolate, scan, etc.) fire-and-forget by default
+/// (no polling in the CLI). The user sees the action ID and status so they
+/// can track it in the MDE portal or poll separately.
+fn run_machine_action(
+    result: Result<mde_lr::action::MachineAction, mde_lr::error::MdeError>,
+) -> ExitCode {
+    match result {
+        Ok(action) => {
+            println!("Action submitted successfully");
+            println!("  Action ID: {}", action.id);
+            println!("  Status:    {:?}", action.status);
+            if let Some(t) = &action.action_type {
+                println!("  Type:      {t}");
+            }
+            if let Some(m) = &action.machine_id {
+                println!("  Machine:   {m}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[tokio::main]
@@ -161,16 +258,7 @@ async fn main() -> ExitCode {
         }
     }
 
-    // All remaining actions require --device-id to target a specific machine.
-    let device_id = match &args.device_id {
-        Some(id) => id.as_str(),
-        None => {
-            eprintln!("Error: --device-id is required for live response actions (-g, -r, -p)");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    println!("DeviceID: {device_id}");
+    // Create the authenticated client for all non-token actions.
     let tp = TokenProvider::new(
         &args.tenant_id,
         &args.client_id,
@@ -178,6 +266,113 @@ async fn main() -> ExitCode {
         "https://api.securitycenter.microsoft.com/.default",
     );
     let client = MdeClient::new(tp, None).await;
+
+    // ── List machines (no --device-id required) ────────────────────────
+    if args.actions.list_machines {
+        match machines::list_machines(&client, args.filter.as_deref()).await {
+            Ok(devices) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&devices).unwrap_or_else(|_| "[]".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // All remaining actions require --device-id to target a specific machine.
+    let device_id = match &args.device_id {
+        Some(id) => id.as_str(),
+        None => {
+            eprintln!("Error: --device-id is required for this action");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ── Get machine info ───────────────────────────────────────────────
+    if args.actions.get_machine {
+        match machines::get_machine(&client, device_id).await {
+            Ok(machine) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&machine).unwrap_or_else(|_| "{}".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Machine actions (isolate, scan, quarantine, etc.) ──────────────
+    let comment = args
+        .comment
+        .clone()
+        .unwrap_or_else(|| "Action via mde-lr CLI".to_string());
+
+    if args.actions.isolate {
+        let req = machine_actions::IsolateRequest {
+            comment,
+            isolation_type: args.isolation_type.clone(),
+        };
+        return run_machine_action(
+            machine_actions::isolate_machine(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.unisolate {
+        let req = machine_actions::UnisolateRequest { comment };
+        return run_machine_action(
+            machine_actions::unisolate_machine(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.scan {
+        let req = machine_actions::AntivirusScanRequest {
+            comment,
+            scan_type: args.scan_type.clone(),
+        };
+        return run_machine_action(
+            machine_actions::run_antivirus_scan(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.collect_investigation {
+        let req = machine_actions::CollectInvestigationPackageRequest { comment };
+        return run_machine_action(
+            machine_actions::collect_investigation_package(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.stop_quarantine {
+        let sha1 = match &args.sha1 {
+            Some(s) => s.clone(),
+            None => {
+                eprintln!("Error: --sha1 is required when using --stop-quarantine");
+                return ExitCode::FAILURE;
+            }
+        };
+        let req = machine_actions::StopAndQuarantineFileRequest { comment, sha1 };
+        return run_machine_action(
+            machine_actions::stop_and_quarantine_file(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.restrict_execution {
+        let req = machine_actions::RestrictCodeExecutionRequest { comment };
+        return run_machine_action(
+            machine_actions::restrict_code_execution(&client, device_id, &req, None).await,
+        );
+    }
+    if args.actions.unrestrict_execution {
+        let req = machine_actions::UnrestrictCodeExecutionRequest { comment };
+        return run_machine_action(
+            machine_actions::unrestrict_code_execution(&client, device_id, &req, None).await,
+        );
+    }
+
+    println!("DeviceID: {device_id}");
 
     // Build the LiveResponseRequest based on the selected action flag.
     // Each action has its own parameter validation: GetFile and PutFile
@@ -605,6 +800,130 @@ mod tests {
         assert_eq!(
             output_path_for_index(&base, 1, 2),
             PathBuf::from("/tmp/output_1")
+        );
+    }
+
+    // ── Machine action flags ────────────────────────────────────────
+
+    #[test]
+    fn isolate_flag_parses_with_defaults() {
+        let mut args = base_args();
+        args.push("--isolate");
+        let cli = Cli::try_parse_from(args).expect("should parse --isolate");
+        assert!(cli.actions.isolate);
+        // Default isolation type is "Full".
+        assert_eq!(cli.isolation_type, "Full");
+        // Default comment is None (main() provides a default string).
+        assert!(cli.comment.is_none());
+    }
+
+    #[test]
+    fn isolate_flag_with_selective_type_and_comment() {
+        let mut args = base_args();
+        args.extend_from_slice(&[
+            "--isolate",
+            "--isolation-type",
+            "Selective",
+            "--comment",
+            "Isolate for investigation",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("should parse --isolate with options");
+        assert!(cli.actions.isolate);
+        assert_eq!(cli.isolation_type, "Selective");
+        assert_eq!(cli.comment.as_deref(), Some("Isolate for investigation"));
+    }
+
+    #[test]
+    fn scan_flag_parses_with_full_scan_type() {
+        let mut args = base_args();
+        args.extend_from_slice(&["--scan", "--scan-type", "Full"]);
+        let cli = Cli::try_parse_from(args).expect("should parse --scan with --scan-type");
+        assert!(cli.actions.scan);
+        assert_eq!(cli.scan_type, "Full");
+    }
+
+    #[test]
+    fn stop_quarantine_parses_with_sha1() {
+        let mut args = base_args();
+        args.extend_from_slice(&[
+            "--stop-quarantine",
+            "--sha1",
+            "87662bc3d60e4200ceaf7aae249d1c343f4b83c9",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("should parse --stop-quarantine with --sha1");
+        assert!(cli.actions.stop_quarantine);
+        assert_eq!(
+            cli.sha1.as_deref(),
+            Some("87662bc3d60e4200ceaf7aae249d1c343f4b83c9")
+        );
+    }
+
+    #[test]
+    fn get_machine_flag_parses() {
+        let mut args = base_args();
+        args.push("--get-machine");
+        let cli = Cli::try_parse_from(args).expect("should parse --get-machine");
+        assert!(cli.actions.get_machine);
+    }
+
+    #[test]
+    fn list_machines_flag_parses_without_device_id() {
+        // --list-machines doesn't require --device-id.
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-machines",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --list-machines");
+        assert!(cli.actions.list_machines);
+        assert!(cli.device_id.is_none());
+    }
+
+    #[test]
+    fn list_machines_with_filter() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-machines",
+            "--filter",
+            "healthStatus eq 'Active'",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --list-machines with --filter");
+        assert!(cli.actions.list_machines);
+        assert_eq!(cli.filter.as_deref(), Some("healthStatus eq 'Active'"));
+    }
+
+    #[test]
+    fn isolate_conflicts_with_scan() {
+        // Machine action flags are mutually exclusive (same group as -g, -r, -p).
+        let mut args = base_args();
+        args.extend_from_slice(&["--isolate", "--scan"]);
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when --isolate and --scan are both set"
+        );
+    }
+
+    #[test]
+    fn isolate_conflicts_with_getfile() {
+        // Machine action flags conflict with live response flags too.
+        let mut args = base_args();
+        args.extend_from_slice(&["--isolate", "-g"]);
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when --isolate and -g are both set"
         );
     }
 }

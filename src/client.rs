@@ -898,11 +898,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let form = reqwest::multipart::Form::new()
-            .part(
-                "file",
-                reqwest::multipart::Part::bytes(b"script content".to_vec()).file_name("test.ps1"),
-            );
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(b"script content".to_vec()).file_name("test.ps1"),
+        );
 
         let err = client
             .upload_multipart::<TestPayload>("api/libraryfiles", form)

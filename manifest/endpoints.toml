@@ -116,7 +116,8 @@ path = "/api/machines/{machine_id}/isolate"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.Isolate"]
-implemented = false
+implemented = true
+notes = "Supports Full, Selective, and UnManagedDevice isolation types"
 
 [[endpoints]]
 family = "machine_actions"
@@ -126,7 +127,7 @@ path = "/api/machines/{machine_id}/unisolate"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.Isolate"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "machine_actions"
@@ -136,7 +137,8 @@ path = "/api/machines/{machine_id}/runAntiVirusScan"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.Scan"]
-implemented = false
+implemented = true
+notes = "Supports Quick and Full scan types"
 
 [[endpoints]]
 family = "machine_actions"
@@ -146,7 +148,7 @@ path = "/api/machines/{machine_id}/collectInvestigationPackage"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.CollectForensics"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "machine_actions"
@@ -156,7 +158,8 @@ path = "/api/machines/{machine_id}/StopAndQuarantineFile"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.StopAndQuarantine"]
-implemented = false
+implemented = true
+notes = "Requires SHA-1 hash of file to quarantine"
 
 [[endpoints]]
 family = "machine_actions"
@@ -166,7 +169,7 @@ path = "/api/machines/{machine_id}/restrictCodeExecution"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.RestrictExecution"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "machine_actions"
@@ -176,7 +179,7 @@ path = "/api/machines/{machine_id}/unrestrictCodeExecution"
 request_content_type = "application/json"
 response_status = 201
 permissions = ["Machine.RestrictExecution"]
-implemented = false
+implemented = true
 
 # ── Machines ─────────────────────────────────────────────────────────
 
@@ -188,7 +191,8 @@ path = "/api/machines"
 request_content_type = ""
 response_status = 200
 permissions = ["Machine.ReadWrite.All"]
-implemented = false
+implemented = true
+notes = "Supports OData $filter on computerDnsName, healthStatus, osPlatform, riskScore, etc."
 
 [[endpoints]]
 family = "machines"
@@ -198,7 +202,7 @@ path = "/api/machines/{machine_id}"
 request_content_type = ""
 response_status = 200
 permissions = ["Machine.ReadWrite.All"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "machines"
@@ -208,7 +212,8 @@ path = "/api/machines/{machine_id}"
 request_content_type = "application/json"
 response_status = 200
 permissions = ["Machine.ReadWrite.All"]
-implemented = false
+implemented = true
+notes = "Updatable fields: machineTags (replace), deviceValue"
 
 # ── Alerts ───────────────────────────────────────────────────────────
 
