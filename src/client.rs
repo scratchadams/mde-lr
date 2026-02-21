@@ -455,6 +455,77 @@ impl MdeClient {
         Ok(())
     }
 
+    /// Sends an authenticated JSON request that expects no response body.
+    ///
+    /// Combines the JSON body serialization of `send_json` with the empty
+    /// response handling of `send_no_content`. Used for endpoints that accept
+    /// a JSON request body but return 200 with an empty (or ignorable) body,
+    /// such as `PATCH /api/alerts/batchUpdate`.
+    ///
+    /// Retry behavior is identical to `send_json`: one-shot 401 retry and
+    /// 429 throttle retry per the configured `RetryPolicy`.
+    async fn send_json_no_content<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> crate::error::Result<()> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut throttle_retries: u32 = 0;
+
+        loop {
+            let token = self.bearer_token().await?;
+            let resp = self
+                .build_request(method.clone(), &url, &token, Some(body))
+                .send()
+                .await
+                .map_err(MdeError::Network)?;
+
+            let status = resp.status();
+
+            if status == StatusCode::UNAUTHORIZED {
+                let fresh_token = self.force_refresh().await?;
+                let retry_resp = self
+                    .build_request(method.clone(), &url, &fresh_token, Some(body))
+                    .send()
+                    .await
+                    .map_err(MdeError::Network)?;
+
+                let retry_status = retry_resp.status();
+                if retry_status == StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after = parse_retry_after(&retry_resp);
+                    self.handle_throttle(retry_after, &mut throttle_retries)
+                        .await?;
+                    continue;
+                }
+
+                return self.parse_empty_response(retry_resp).await;
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let retry_after = parse_retry_after(&resp);
+                self.handle_throttle(retry_after, &mut throttle_retries)
+                    .await?;
+                continue;
+            }
+
+            return self.parse_empty_response(resp).await;
+        }
+    }
+
+    /// Sends an authenticated PATCH request with a JSON body that expects
+    /// no response body.
+    ///
+    /// Used for batch-update endpoints like `PATCH /api/alerts/batchUpdate`
+    /// that accept a JSON request but return 200 with an empty body.
+    pub async fn patch_no_content<B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> crate::error::Result<()> {
+        self.send_json_no_content(Method::PATCH, path, body).await
+    }
+
     /// Sends an authenticated DELETE request that expects no response body.
     ///
     /// Returns `Ok(())` on success (typically 204 No Content). Used for

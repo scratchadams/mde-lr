@@ -13,8 +13,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+use mde_lr::alerts;
 use mde_lr::auth::TokenProvider;
 use mde_lr::client::MdeClient;
+use mde_lr::library;
 use mde_lr::live_response::{
     Command, CommandType, LiveResponseRequest, Param, ScriptResult, run_live_response,
 };
@@ -93,10 +95,42 @@ struct Cli {
     #[arg(long)]
     sha1: Option<String>,
 
-    /// OData $filter expression for --list-machines.
-    /// Example: "healthStatus eq 'Active'"
+    /// OData $filter expression for --list-machines and --list-alerts.
+    /// Example: "healthStatus eq 'Active'" or "severity eq 'High'"
     #[arg(long)]
     filter: Option<String>,
+
+    /// Description for a library file upload (used with --upload-library).
+    #[arg(long)]
+    description: Option<String>,
+
+    /// Alert ID for --get-alert and --update-alert.
+    #[arg(long)]
+    alert_id: Option<String>,
+
+    /// Comma-separated alert IDs for --batch-update-alerts.
+    #[arg(long)]
+    alert_ids: Option<String>,
+
+    /// Alert status: "New", "InProgress", or "Resolved".
+    /// Used with --update-alert and --batch-update-alerts.
+    #[arg(long)]
+    status: Option<String>,
+
+    /// Alert classification: "TruePositive", "InformationalExpectedActivity",
+    /// or "FalsePositive". Used with --update-alert and --batch-update-alerts.
+    #[arg(long)]
+    classification: Option<String>,
+
+    /// Alert determination (varies by classification).
+    /// Used with --update-alert and --batch-update-alerts.
+    #[arg(long)]
+    determination: Option<String>,
+
+    /// User or mailbox to assign an alert to (email address).
+    /// Used with --update-alert and --batch-update-alerts.
+    #[arg(long)]
+    assigned_to: Option<String>,
 
     #[command(flatten)]
     actions: ActionFlags,
@@ -171,6 +205,46 @@ struct ActionFlags {
     /// Does not require --device-id. Prints JSON to stdout.
     #[arg(long)]
     list_machines: bool,
+
+    /// List all files in the Live Response library.
+    /// Does not require --device-id. Prints JSON to stdout.
+    #[arg(long)]
+    list_library: bool,
+
+    /// Upload a file to the Live Response library.
+    /// Requires --file (local path to the file to upload).
+    /// Optionally use --description. Does not require --device-id.
+    #[arg(long)]
+    upload_library: bool,
+
+    /// Delete a file from the Live Response library by name.
+    /// Requires --file (the library filename, not a local path).
+    /// Does not require --device-id.
+    #[arg(long)]
+    delete_library: bool,
+
+    /// List security alerts visible to the tenant. Use --filter for OData filtering.
+    /// Does not require --device-id. Prints JSON to stdout.
+    #[arg(long)]
+    list_alerts: bool,
+
+    /// Retrieve a single alert by ID. Requires --alert-id.
+    /// Does not require --device-id. Prints JSON to stdout.
+    #[arg(long)]
+    get_alert: bool,
+
+    /// Update an alert's status, classification, or assignment.
+    /// Requires --alert-id. Use --status, --classification, --determination,
+    /// --assigned-to, and/or --comment. Does not require --device-id.
+    #[arg(long)]
+    update_alert: bool,
+
+    /// Batch-update multiple alerts. Requires --alert-ids (comma-separated).
+    /// Use --status, --classification, --determination, --assigned-to,
+    /// and/or --comment. Does not require --device-id.
+    /// Rate limit: 10 calls/min (stricter than standard 100/min).
+    #[arg(long)]
+    batch_update_alerts: bool,
 }
 
 /// Computes the output file path for a given command index.
@@ -275,6 +349,193 @@ async fn main() -> ExitCode {
                     "{}",
                     serde_json::to_string_pretty(&devices).unwrap_or_else(|_| "[]".to_string())
                 );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── List library files (no --device-id required) ─────────────────────
+    if args.actions.list_library {
+        match library::list_library_files(&client).await {
+            Ok(files) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&files).unwrap_or_else(|_| "[]".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Upload library file (no --device-id required) ──────────────────
+    if args.actions.upload_library {
+        let file_path = match &args.file {
+            Some(path) => path,
+            None => {
+                eprintln!("Error: --file is required when using --upload-library");
+                return ExitCode::FAILURE;
+            }
+        };
+        let file_bytes = match std::fs::read(file_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("Error: failed to read {}: {e}", file_path.display());
+                return ExitCode::FAILURE;
+            }
+        };
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        match library::upload_library_file(
+            &client,
+            &file_name,
+            file_bytes,
+            args.description.as_deref(),
+            false,
+        )
+        .await
+        {
+            Ok(lib_file) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&lib_file).unwrap_or_else(|_| "{}".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Delete library file (no --device-id required) ──────────────────
+    if args.actions.delete_library {
+        let file_name = match &args.file {
+            Some(path) => path.to_string_lossy().to_string(),
+            None => {
+                eprintln!(
+                    "Error: --file is required when using --delete-library (library file name)"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        match library::delete_library_file(&client, &file_name).await {
+            Ok(()) => {
+                println!("Deleted library file: {file_name}");
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── List alerts (no --device-id required) ──────────────────────────
+    if args.actions.list_alerts {
+        match alerts::list_alerts(&client, args.filter.as_deref()).await {
+            Ok(alert_list) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&alert_list).unwrap_or_else(|_| "[]".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Get alert (no --device-id required) ────────────────────────────
+    if args.actions.get_alert {
+        let alert_id = match &args.alert_id {
+            Some(id) => id.as_str(),
+            None => {
+                eprintln!("Error: --alert-id is required for --get-alert");
+                return ExitCode::FAILURE;
+            }
+        };
+        match alerts::get_alert(&client, alert_id).await {
+            Ok(alert) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&alert).unwrap_or_else(|_| "{}".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Update alert (no --device-id required) ─────────────────────────
+    if args.actions.update_alert {
+        let alert_id = match &args.alert_id {
+            Some(id) => id.as_str(),
+            None => {
+                eprintln!("Error: --alert-id is required for --update-alert");
+                return ExitCode::FAILURE;
+            }
+        };
+        let update_req = alerts::UpdateAlertRequest {
+            status: args.status.clone(),
+            assigned_to: args.assigned_to.clone(),
+            classification: args.classification.clone(),
+            determination: args.determination.clone(),
+            comment: args.comment.clone(),
+        };
+        match alerts::update_alert(&client, alert_id, &update_req).await {
+            Ok(alert) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&alert).unwrap_or_else(|_| "{}".to_string())
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // ── Batch update alerts (no --device-id required) ──────────────────
+    if args.actions.batch_update_alerts {
+        let alert_ids: Vec<String> = match &args.alert_ids {
+            Some(ids) => ids.split(',').map(|s| s.trim().to_string()).collect(),
+            None => {
+                eprintln!(
+                    "Error: --alert-ids is required for --batch-update-alerts (comma-separated)"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        let batch_req = alerts::BatchUpdateAlertsRequest {
+            alert_ids,
+            status: args.status.clone(),
+            assigned_to: args.assigned_to.clone(),
+            classification: args.classification.clone(),
+            determination: args.determination.clone(),
+            comment: args.comment.clone(),
+        };
+        match alerts::batch_update_alerts(&client, &batch_req).await {
+            Ok(()) => {
+                println!("Batch update completed successfully");
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
@@ -924,6 +1185,200 @@ mod tests {
         assert!(
             result.is_err(),
             "parsing should fail when --isolate and -g are both set"
+        );
+    }
+
+    // ── Library flags ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_library_parses_without_device_id() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-library",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --list-library");
+        assert!(cli.actions.list_library);
+        assert!(cli.device_id.is_none());
+    }
+
+    #[test]
+    fn upload_library_parses_with_file_and_description() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--upload-library",
+            "--file",
+            "/tmp/script.ps1",
+            "--description",
+            "Forensic collector",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --upload-library");
+        assert!(cli.actions.upload_library);
+        assert_eq!(
+            cli.file.as_ref().unwrap().to_str().unwrap(),
+            "/tmp/script.ps1"
+        );
+        assert_eq!(cli.description.as_deref(), Some("Forensic collector"));
+    }
+
+    #[test]
+    fn delete_library_parses_with_file() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--delete-library",
+            "--file",
+            "old-script.ps1",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --delete-library");
+        assert!(cli.actions.delete_library);
+    }
+
+    // ── Alert flags ────────────────────────────────────────────────────
+
+    #[test]
+    fn list_alerts_parses_without_device_id() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-alerts",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --list-alerts");
+        assert!(cli.actions.list_alerts);
+    }
+
+    #[test]
+    fn list_alerts_with_filter() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-alerts",
+            "--filter",
+            "severity eq 'High'",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --list-alerts with --filter");
+        assert!(cli.actions.list_alerts);
+        assert_eq!(cli.filter.as_deref(), Some("severity eq 'High'"));
+    }
+
+    #[test]
+    fn get_alert_parses_with_alert_id() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--get-alert",
+            "--alert-id",
+            "alert-123",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --get-alert");
+        assert!(cli.actions.get_alert);
+        assert_eq!(cli.alert_id.as_deref(), Some("alert-123"));
+    }
+
+    #[test]
+    fn update_alert_parses_with_all_fields() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--update-alert",
+            "--alert-id",
+            "alert-456",
+            "--status",
+            "Resolved",
+            "--classification",
+            "FalsePositive",
+            "--determination",
+            "NotMalicious",
+            "--assigned-to",
+            "analyst@contoso.com",
+            "--comment",
+            "False positive confirmed",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --update-alert with all fields");
+        assert!(cli.actions.update_alert);
+        assert_eq!(cli.alert_id.as_deref(), Some("alert-456"));
+        assert_eq!(cli.status.as_deref(), Some("Resolved"));
+        assert_eq!(cli.classification.as_deref(), Some("FalsePositive"));
+        assert_eq!(cli.determination.as_deref(), Some("NotMalicious"));
+        assert_eq!(cli.assigned_to.as_deref(), Some("analyst@contoso.com"));
+        assert_eq!(cli.comment.as_deref(), Some("False positive confirmed"));
+    }
+
+    #[test]
+    fn batch_update_alerts_parses_with_ids() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--batch-update-alerts",
+            "--alert-ids",
+            "alert-1,alert-2,alert-3",
+            "--status",
+            "Resolved",
+        ];
+        let cli = Cli::try_parse_from(args).expect("should parse --batch-update-alerts");
+        assert!(cli.actions.batch_update_alerts);
+        assert_eq!(cli.alert_ids.as_deref(), Some("alert-1,alert-2,alert-3"));
+        assert_eq!(cli.status.as_deref(), Some("Resolved"));
+    }
+
+    #[test]
+    fn list_alerts_conflicts_with_list_machines() {
+        let args = vec![
+            "mde-lr",
+            "--tenant-id",
+            "tid-456",
+            "--client-id",
+            "cid-789",
+            "--secret",
+            "s3cret",
+            "--list-alerts",
+            "--list-machines",
+        ];
+        let result = Cli::try_parse_from(args);
+        assert!(
+            result.is_err(),
+            "parsing should fail when --list-alerts and --list-machines are both set"
         );
     }
 }

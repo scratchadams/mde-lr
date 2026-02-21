@@ -2,16 +2,20 @@
 
 Status: Draft
 Owner: mde-lr maintainers
-Last updated: 2026-02-16
+Last updated: 2026-02-20
 
 ## 1. Purpose and Scope
 
 This document explains how `mde-lr` is built today: module boundaries,
 runtime flow, failure semantics, and key design choices.
 
-`mde-lr` is an async Rust CLI that executes Microsoft Defender for Endpoint
-(MDE) Live Response actions against a target device. The implemented CLI path
-today supports `GetFile`, `RunScript`, and `PutFile` actions.
+`mde-lr` is an async Rust CLI and library for Microsoft Defender for Endpoint
+(MDE). The implemented surface covers five API families: Live Response
+(GetFile, RunScript, PutFile), Machines (list, get, update), Machine
+Actions (isolate, unisolate, AV scan, collect investigation package, stop and
+quarantine file, restrict/unrestrict code execution), Library (list, upload,
+delete), and Alerts (list, get, update, batch-update). 21 of 32 manifest
+endpoints are implemented.
 
 Observability is treated as a first-class engineering value for the next
 expansion phase: failures should be diagnosable with structured context from
@@ -64,8 +68,8 @@ is no parallelism across steps.
 | Cached token must refresh before hard expiry | Avoid edge-of-expiry failures | `src/auth.rs` (`EXPIRY_BUFFER_SECS=60`, `is_expired`) |
 | Token acquisition is lazy | No explicit "login" step required; first request triggers refresh automatically | `src/client.rs` (`bearer_token` checks `token()`, refreshes if `None`) |
 | Mutex lock is never held across HTTP round-trips | Prevents serializing all API calls behind a single lock | `src/client.rs` (`bearer_token` and `force_refresh` clone the token string, then release the lock before any HTTP call) |
-| Polling must terminate | Prevent infinite hangs | `src/live_response.rs` (`PollConfig.timeout`) |
-| Unknown action statuses must not crash deserialization | Forward compatibility with API changes | `ActionStatus::Unknown` with `#[serde(other)]` |
+| Polling must terminate | Prevent infinite hangs | `src/action.rs` (`PollConfig.timeout`, `poll_action`) |
+| Unknown action statuses must not crash deserialization | Forward compatibility with API changes | `ActionStatus::Unknown` with `#[serde(other)]` in `src/action.rs` |
 | SAS download must not attach bearer auth | SAS URL already carries authorization via query-string token | `MdeClient::download` |
 | Token endpoint uses form-encoded bodies, not JSON | Azure AD `/oauth2/v2.0/token` requires `application/x-www-form-urlencoded` | `src/auth.rs` (`reqwest::RequestBuilder::form()` serializes via `serde_urlencoded`) |
 | Public API surface returns fallible async results | Explicit failure handling across network boundaries | `Result<T, MdeError>` typed error hierarchy |
@@ -79,13 +83,23 @@ is no parallelism across steps.
 
 | Module | Responsibility | External side effects |
 |---|---|---|
-| `src/lib.rs` | Crate root — re-exports `auth`, `client`, `error`, and `live_response` as the public API surface | None (module declaration only) |
-| `src/main.rs` | CLI parsing and command dispatch for GetFile, RunScript, PutFile | stdout/stderr, process exit code |
+| `src/lib.rs` | Crate root — re-exports all public modules | None (module declaration only) |
+| `src/main.rs` | CLI parsing and command dispatch for all 21 action flags | stdout/stderr, process exit code |
 | `src/auth.rs` | OAuth2 token acquisition + cache lifecycle | HTTPS to Azure AD token endpoint |
-| `src/client.rs` | Authenticated HTTP wrapper and retry behavior | HTTPS to MDE API and SAS URLs |
+| `src/client.rs` | Authenticated HTTP wrapper with 401/429 retry, PATCH/DELETE/multipart | HTTPS to MDE API and SAS URLs |
 | `src/error.rs` | Typed error hierarchy (`MdeError`) for all library operations | None (type definitions only) |
-| `src/live_response.rs` | Live Response request/response models + orchestration | Polling loop + downloads |
-| `tests/live_response_flow.rs` | Integration behavior tests over mock HTTP | in-process mock server only |
+| `src/action.rs` | Shared action-polling abstraction (`ActionStatus`, `MachineAction`, `PollConfig`, `poll_action`) | None (reused by `live_response` and `machine_actions`) |
+| `src/live_response.rs` | Live Response request/response models + 4-step orchestration | Polling loop + downloads |
+| `src/machines.rs` | Machines family — list (OData filter), get, update endpoints | HTTPS to MDE API |
+| `src/machine_actions.rs` | Machine Actions family — 7 incident response endpoints with POST → poll pattern | HTTPS to MDE API |
+| `src/library.rs` | Library family — list, upload (multipart), delete library files | HTTPS to MDE API |
+| `src/alerts.rs` | Alerts family — list, get, update, batch-update security alerts | HTTPS to MDE API |
+| `tests/live_response_flow.rs` | Integration tests for live response flow (7 tests) | in-process mock server only |
+| `tests/machines_flow.rs` | Integration tests for machines endpoints (7 tests) | in-process mock server only |
+| `tests/machine_actions_flow.rs` | Integration tests for machine action endpoints (7 tests) | in-process mock server only |
+| `tests/library_flow.rs` | Integration tests for library endpoints (5 tests) | in-process mock server only |
+| `tests/alerts_flow.rs` | Integration tests for alert endpoints (7 tests) | in-process mock server only |
+| `tests/manifest_validation.rs` | Endpoint manifest TOML validation (3 tests) | filesystem read only |
 
 `src/lib.rs` defines the crate boundary. Any type or function that downstream
 consumers (or integration tests) can reach must be re-exported through one of
@@ -98,7 +112,7 @@ API surface.
                          +------------------------+
                          | main.rs                |
                          | - clap::Parser         |
-                         | - builds request       |
+                         | - dispatches to action |
                          +-----------+------------+
                                      |
                                      v
@@ -113,32 +127,45 @@ API surface.
                       token    |              | API JSON + bytes
                       refresh  |              |
                                v              v
-                   +----------------+   +------------------------+
-                   | TokenProvider  |   | run_live_response()    |
-                   | (auth.rs)      |   | (live_response.rs)     |
-                   +----------------+   | free function, borrows |
-                                        | &MdeClient             |
-                                        +------------------------+
+                   +----------------+   +-----------------------------+
+                   | TokenProvider  |   | Endpoint families:          |
+                   | (auth.rs)      |   |  - run_live_response()      |
+                   +----------------+   |  - machines::*()            |
+                                        |  - machine_actions::*()     |
+                                        |  - library::*()             |
+                                        |  - alerts::*()              |
+                                        +-------------+---------------+
+                                                      |
+                                                      v
+                                        +-----------------------------+
+                                        | poll_action() (action.rs)   |
+                                        | shared polling abstraction  |
+                                        +-----------------------------+
 ```
 
-Note that `run_live_response` is a **free function** that borrows `&MdeClient`,
-not a method on `MdeClient`. This is a deliberate composability choice: the
-orchestration logic depends on the client's capabilities but doesn't own it,
-allowing the same client to be reused across multiple orchestration calls.
+All endpoint functions are **free functions** that borrow `&MdeClient`, not
+methods on it. This keeps transport separate from domain logic and allows the
+same client to be reused across multiple endpoint families.
 
 ### 4.3 Module Dependency Graph
 
 ```text
-main.rs ──> MdeClient ──> TokenProvider
+main.rs ──> MdeClient ──────────> TokenProvider
    │            │
    │            └──> reqwest::Client
    │
-   └──> run_live_response() ──> MdeClient (via &self)
+   ├──> run_live_response()     ──> MdeClient + poll_action()
+   ├──> machines::*()           ──> MdeClient
+   ├──> machine_actions::*()    ──> MdeClient + poll_action()
+   ├──> library::*()            ──> MdeClient
+   └──> alerts::*()             ──> MdeClient
 ```
 
-Arrows point from consumer to dependency. `run_live_response` and `MdeClient`
+Arrows point from consumer to dependency. Endpoint functions and `MdeClient`
 are peers — neither owns the other. `main.rs` is the only module that
-coordinates all three.
+coordinates all components. `poll_action()` in `action.rs` is shared between
+`live_response` and `machine_actions`. `library` and `alerts` use simpler
+request/response patterns (no polling).
 
 ## 5. Runtime Flows
 
@@ -325,18 +352,51 @@ error. This provides forward compatibility if Microsoft adds new status values.
 | Poll action status | `GET api/machineactions/{action_id}` | Bearer | JSON response |
 | Get command result link | `GET api/machineactions/{action_id}/GetLiveResponseResultDownloadLink(index={i})` | Bearer | JSON response |
 | Download result payload | `GET {sas_url}` | SAS query token (no bearer) | Raw bytes |
+| List machines | `GET api/machines` | Bearer | JSON response (OData `$filter` in query) |
+| Get machine | `GET api/machines/{machine_id}` | Bearer | JSON response |
+| Update machine | `PATCH api/machines/{machine_id}` | Bearer | JSON (camelCase keys) |
+| Isolate machine | `POST api/machines/{machine_id}/isolate` | Bearer | JSON (PascalCase keys) |
+| Unisolate machine | `POST api/machines/{machine_id}/unisolate` | Bearer | JSON (PascalCase keys) |
+| AV scan | `POST api/machines/{machine_id}/runAntiVirusScan` | Bearer | JSON (PascalCase keys) |
+| Collect investigation | `POST api/machines/{machine_id}/collectInvestigationPackage` | Bearer | JSON (PascalCase keys) |
+| Stop & quarantine | `POST api/machines/{machine_id}/StopAndQuarantineFile` | Bearer | JSON (PascalCase keys) |
+| Restrict execution | `POST api/machines/{machine_id}/restrictCodeExecution` | Bearer | JSON (PascalCase keys) |
+| Unrestrict execution | `POST api/machines/{machine_id}/unrestrictCodeExecution` | Bearer | JSON (PascalCase keys) |
+| List library files | `GET api/libraryfiles` | Bearer | JSON response (OData collection) |
+| Upload library file | `POST api/libraryfiles` | Bearer | Multipart/form-data |
+| Delete library file | `DELETE api/libraryfiles/{fileName}` | Bearer | 204 No Content |
+| List alerts | `GET api/alerts` | Bearer | JSON response (OData `$filter` in query) |
+| Get alert | `GET api/alerts/{alert_id}` | Bearer | JSON response |
+| Update alert | `PATCH api/alerts/{alert_id}` | Bearer | JSON (camelCase keys) |
+| Batch update alerts | `PATCH api/alerts/batchUpdate` | Bearer | JSON (camelCase keys), empty response |
 
 ### 7.2 CLI Surface (Current)
 
 | Flag | Role | Current behavior |
 |---|---|---|
-| `--device-id`, `--tenant-id`, `--client-id` | Required identity fields | Required for execution |
+| `--device-id`, `--tenant-id`, `--client-id` | Identity fields | `--tenant-id` and `--client-id` always required; `--device-id` required for device-targeted actions (not library, alert, `--list-machines`, or `-t`) |
 | `--secret` / `MDE_CLIENT_SECRET` env var | Client secret for OAuth2 | Required; prefer env var to avoid process-list exposure |
-| `-g` + `--file` | GetFile action | Collect a file from the remote device; `--file` is validated at runtime |
-| `-r` + `--script` [+ `--args`] | RunScript action | Execute a PowerShell script on the remote device; `--script` is validated at runtime, `--args` is optional and allows hyphen-prefixed values |
-| `-p` + `--file` | PutFile action | Upload a file from the MDE library to the remote device; `--file` is validated at runtime |
-| `-t` | Token inspection | Acquire an OAuth2 token and print it to stdout; does not require `--device-id` |
-| `--out` | Output file path | Save downloaded result bytes to disk; for multi-command results, index suffixes are added (e.g. `out_0.zip`, `out_1.zip`) |
+| `-g` + `--file` | GetFile action | Collect a file from the remote device |
+| `-r` + `--script` [+ `--args`] | RunScript action | Execute a PowerShell script on the remote device |
+| `-p` + `--file` | PutFile action | Upload a file from the MDE library to the remote device |
+| `-t` | Token inspection | Acquire an OAuth2 token and print it to stdout |
+| `--isolate` + `--comment` [+ `--isolation-type`] | Isolate device | Isolate from network (Full/Selective/UnManagedDevice) |
+| `--unisolate` + `--comment` | Unisolate device | Release from network isolation |
+| `--scan` + `--comment` [+ `--scan-type`] | AV scan | Run Defender Antivirus scan (Quick/Full) |
+| `--collect-investigation` + `--comment` | Forensics | Collect investigation package |
+| `--stop-quarantine` + `--comment` + `--sha1` | Quarantine | Stop and quarantine a file by SHA-1 |
+| `--restrict-execution` + `--comment` | Restrict apps | Restrict code execution to Microsoft-signed only |
+| `--unrestrict-execution` + `--comment` | Unrestrict apps | Remove code execution restrictions |
+| `--get-machine` | Device details | Get full details for a specific machine |
+| `--list-machines` [+ `--filter`] | Device listing | List machines, optionally filtered by OData expression |
+| `--list-library` | List library files | List all Live Response library files |
+| `--upload-library` + `--file` [+ `--description`] | Upload library file | Upload a file to the Live Response library (multipart) |
+| `--delete-library` + `--file` | Delete library file | Delete a file from the Live Response library |
+| `--list-alerts` [+ `--filter`] | List alerts | List security alerts, optionally filtered by OData expression |
+| `--get-alert` + `--alert-id` | Get alert | Get full details for a specific alert |
+| `--update-alert` + `--alert-id` [+ status/classification/determination/assigned-to/comment] | Update alert | Update an individual alert's triage fields |
+| `--batch-update-alerts` + `--alert-ids` [+ status/classification/determination/comment] | Batch update | Update multiple alerts at once |
+| `--out` | Output file path | Save downloaded result bytes to disk |
 | `--config`, `--query` | Future placeholders | Parsed but currently unused |
 
 **Exit codes:**
@@ -344,9 +404,13 @@ error. This provides forward compatibility if Microsoft adds new status values.
 - `1`: runtime error (auth failure, API error, timeout, etc.)
 - `2`: argument validation error (clap handles this automatically)
 
-**Action flag constraint:** Exactly one of `-g`, `-r`, `-p`, `-t` must be set
-per invocation. This is enforced at parse time by clap's `#[group(required =
-true, multiple = false)]` attribute on `ActionFlags`.
+**Action flag constraint:** Exactly one action flag must be set per invocation.
+This is enforced at parse time by clap's `#[group(required = true, multiple =
+false)]` attribute on `ActionFlags`.
+
+**Machine actions:** Fire-and-forget by default — the CLI prints the action ID
+and initial status. Use the action ID in the MDE portal or programmatic polling
+to track progress.
 
 **RunScript output handling:** When `-r` is used, the CLI automatically parses
 the downloaded bytes as `ScriptResult` JSON and displays the script name, exit
@@ -429,10 +493,19 @@ lenient for token failures.
 | Unit tests in `src/auth.rs` (11 tests) | Token URL construction, serde, cache expiry/buffer logic | Token invalid before refresh, expiry is deterministic, buffer boundary behavior |
 | Unit tests in `src/client.rs` (12 tests) | HTTP methods (GET/POST/PUT/PATCH/DELETE), 401 retry, 429 throttle retry, error body preservation, SAS download, multipart upload | One-shot 401 retry, 429 retry with Retry-After, retry exhaustion, max delay cap, PATCH/DELETE/multipart happy paths |
 | Unit tests in `src/error.rs` (8 tests) | Error display, source chaining, Send+Sync, Throttled variant | All variants display correctly, source chain traversable, Throttled displays retry-after |
-| Unit tests in `src/live_response.rs` (10 tests) | API model serde, unknown status handling, poll defaults, request round-trips | Forward-compatible enum parsing, PascalCase serialization, PutFile variant |
-| Unit tests in `src/main.rs` (17 tests) | CLI argument parsing for all actions, output path indexing | Action flag enforcement, parameter validation, conflicting flags rejected, --out parsing, path index logic |
+| Unit tests in `src/action.rs` (7 tests) | ActionStatus serde, MachineAction deserialization, PollConfig defaults | Forward-compatible enum parsing, optional field handling, full response deserialization |
+| Unit tests in `src/live_response.rs` (3 tests) | LiveResponse-specific model serde and request round-trips | PascalCase serialization, PutFile variant |
+| Unit tests in `src/machines.rs` (7 tests) | Machine serde, ODataList, UpdateMachineRequest serialization | Full/minimal/unknown-fields deserialization, optional field defaults, skip-if-none serialization |
+| Unit tests in `src/machine_actions.rs` (7 tests) | Request type serialization for all 7 endpoints | PascalCase keys match MDE API contract, no snake_case leaks |
+| Unit tests in `src/library.rs` (4 tests) | LibraryFile deserialization (full, minimal, unknown fields, ODataList) | camelCase field mapping, optional field defaults, forward compatibility |
+| Unit tests in `src/alerts.rs` (9 tests) | Alert deserialization, UpdateAlertRequest/BatchUpdateAlertsRequest serialization | Full/minimal/unknown-fields Alert, ODataList, skip-if-none serialization, batch request format |
+| Unit tests in `src/main.rs` (35 tests) | CLI argument parsing for all 21 action flags, output path indexing | Action flag enforcement, parameter validation, conflicting flags rejected, library/alert flags |
 | Integration tests in `tests/live_response_flow.rs` (7 tests) | Full 4-step wiremock flow | End-to-end bytes returned, RunScript parse path, failed/cancelled actions, polling timeout, multi-step progression, multi-command indexing |
-| Integration tests in `tests/manifest_validation.rs` (3 tests) | Endpoint manifest TOML validation | Schema structure, implemented endpoints, valid HTTP verbs |
+| Integration tests in `tests/machines_flow.rs` (7 tests) | Machines family with wiremock | List with/without filter, empty list, get success, get 404, update both fields, update tags only |
+| Integration tests in `tests/machine_actions_flow.rs` (7 tests) | Machine actions with wiremock | Isolate poll-to-success, unisolate fire-and-forget, AV scan progression, investigation failure, quarantine, restrict/unrestrict, 400 API error |
+| Integration tests in `tests/library_flow.rs` (5 tests) | Library family with wiremock | List (2 files), list empty, upload multipart, delete 204, delete 404 |
+| Integration tests in `tests/alerts_flow.rs` (7 tests) | Alerts family with wiremock | List, list with filter, get full alert, get 404, update all fields, update comment only, batch update |
+| Integration tests in `tests/manifest_validation.rs` (3 tests) | Endpoint manifest TOML validation | Schema structure, 21 implemented endpoints, valid HTTP verbs |
 
 ### 10.2 How the Mock Server Works
 
@@ -471,14 +544,16 @@ in-process HTTP server, with no network calls to real Azure services.
 | D-002 | Mutex lock is released before HTTP calls | The lock is acquired to check/refresh the token, the token string is cloned out, and the lock is dropped. This prevents the mutex from serializing all concurrent API calls behind a single lock. | `src/client.rs` (`bearer_token`, `force_refresh`) |
 | D-003 | `send_json<T, B>` generic request helper | Keeps method-specific wrappers (`get`, `post`, `put`) thin and consistent. Single place to implement retry logic. | `src/client.rs` |
 | D-004 | One-shot retry on 401, bounded retry on 429 | 401 handles revoked/stale tokens (one retry). 429 honors `Retry-After` header up to `RetryPolicy::max_retries` (default 3). Both compose: a 401 retry can itself hit 429. Non-401/429 errors propagate immediately. | `src/client.rs` |
-| D-005 | `ActionStatus::Unknown` enum variant with `#[serde(other)]` | Avoids hard deserialization failures if Microsoft adds new status values. Unknown is treated as non-terminal during polling. | `src/live_response.rs` |
+| D-005 | `ActionStatus::Unknown` enum variant with `#[serde(other)]` | Avoids hard deserialization failures if Microsoft adds new status values. Unknown is treated as non-terminal during polling. | `src/action.rs` |
 | D-006 | Separate token/API timeout profiles | Token requests are small/fast; result downloads may be large. A single timeout can't serve both well. | `src/auth.rs`, `src/client.rs` |
-| D-007 | `run_live_response` is a free function, not a method on `MdeClient` | Keeps orchestration logic separate from the HTTP client. The client is a reusable transport layer; orchestration is a higher-level concern. This supports future API families without bloating `MdeClient`. | `src/live_response.rs` |
+| D-007 | All endpoint functions are free functions, not methods on `MdeClient` | Keeps orchestration logic separate from the HTTP client. The client is a reusable transport layer; orchestration is a higher-level concern. Each endpoint family is a separate module with its own free functions. | `src/live_response.rs`, `src/machines.rs`, `src/machine_actions.rs` |
 | D-008 | `with_token` + `with_base_url` test constructors | Enable deterministic tests without real cloud dependencies. Separate from production constructors to avoid polluting the public API. | `src/auth.rs`, `src/client.rs` |
 | D-009 | `RetryPolicy` is a separate configurable struct, not hardcoded | Different callers need different retry budgets. Tests use aggressive settings (0s delay); production defaults to 3 retries with 60s cap. | `src/client.rs` |
 | D-010 | `send_no_content` parallel to `send_json` for 204 responses | DELETE and some POST endpoints return empty bodies. Attempting JSON deserialization on 204 would fail. Separate method avoids conditional logic in `parse_response`. | `src/client.rs` |
 | D-011 | Multipart uploads skip 401/429 retry | `reqwest::multipart::Form` is consumed on send (not `Clone`). Buffering form parts for replay adds complexity with little benefit since uploads are infrequent, user-initiated operations. | `src/client.rs` |
 | D-012 | Endpoint manifest as TOML, validated in CI | Tracks API coverage as structured data rather than prose. CI test catches syntax errors and missing fields. Manifest is the foundation for future codegen. | `manifest/endpoints.toml`, `tests/manifest_validation.rs` |
+| D-013 | `patch_no_content` for PATCH with empty response | The batch-update-alerts endpoint returns 200 with empty body. `send_json` would fail trying to deserialize JSON from an empty response. `send_json_no_content` combines JSON request body with empty-response handling. | `src/client.rs` |
+| D-014 | Alert evidence as `Vec<serde_json::Value>` | MDE evidence objects are polymorphic (file, process, IP, etc.) with different schemas per type. Full typing is deferred until concrete use cases emerge; `serde_json::Value` provides forward compatibility. | `src/alerts.rs` |
 
 ## 12. Codegen Boundary
 
@@ -509,8 +584,9 @@ hypothetical shapes.
 | No structured logging/tracing | Harder production debugging of polling and retries | Add `tracing` spans around auth, poll loop, and downloads |
 | Results are fully buffered in memory before writing to disk | Large downloads increase memory pressure | Add optional streaming write-to-disk path (currently `--out` writes after full buffering) |
 | Workspace split | Single crate serves both CLI and library consumers | Split into `mde-lr` (CLI binary) and `mde-lr-lib` (library crate) when a second consumer emerges |
+| 11 unimplemented endpoints | 66% API coverage | Milestone 3 (hunting + indicators), M4 (broad rollout) |
 
-Resolved gaps (completed in Phases 1-4 and Milestone 0):
+Resolved gaps (completed in Phases 1-4, Milestone 0, and Milestone 1):
 - Typed `MdeError` enum with source chaining (Phase 2a)
 - Configurable cloud endpoints for sovereign clouds (Phase 2b)
 - `#![warn(missing_docs)]` enabled (Phase 2c)
@@ -520,6 +596,13 @@ Resolved gaps (completed in Phases 1-4 and Milestone 0):
 - 204 No Content handling for delete endpoints (M0)
 - 429 throttle retry with configurable `RetryPolicy` and `Retry-After` header (M0)
 - Endpoint manifest with CI validation (M0)
+- Shared action-polling abstraction extracted for cross-family reuse (M1)
+- Machines family: list, get, update with OData filtering (M1)
+- Machine Actions family: 7 incident response endpoints (M1)
+- CLI expanded with 9 new action flags (M1)
+- Library family: list, upload (multipart), delete (M2)
+- Alerts family: list, get, update, batch-update (M2)
+- CLI expanded with 8 new action flags + 7 supporting params (M2)
 
 ## 13. Inspiration Notes
 

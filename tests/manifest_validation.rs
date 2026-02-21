@@ -90,8 +90,8 @@ fn manifest_has_implemented_endpoints() {
         .collect();
 
     assert!(
-        implemented.len() >= 14,
-        "at least 14 endpoints should be marked as implemented (4 live_response + 3 machines + 7 machine_actions), found {}",
+        implemented.len() >= 21,
+        "at least 21 endpoints should be marked as implemented (4 live_response + 3 machines + 7 machine_actions + 3 library + 4 alerts), found {}",
         implemented.len()
     );
 
@@ -115,6 +115,15 @@ fn manifest_has_implemented_endpoints() {
         "stop_and_quarantine_file",
         "restrict_code_execution",
         "unrestrict_code_execution",
+        // Library family (3 endpoints)
+        "list_library_files",
+        "upload_library_file",
+        "delete_library_file",
+        // Alerts family (4 endpoints)
+        "list_alerts",
+        "get_alert",
+        "update_alert",
+        "batch_update_alerts",
     ] {
         assert!(
             implemented_names.contains(&expected),

@@ -14,7 +14,7 @@
 
 [meta]
 schema_version = 1
-last_validated = "2026-02-16"
+last_validated = "2026-02-20"
 
 # ── Live Response ────────────────────────────────────────────────────
 
@@ -72,8 +72,8 @@ path = "/api/libraryfiles"
 request_content_type = "multipart/form-data"
 response_status = 200
 permissions = ["Library.Manage"]
-implemented = false
-notes = "Multipart upload: file + Description + OverrideIfExists. Max 20 MB."
+implemented = true
+notes = "Multipart upload: file + Description + OverrideIfExists. Max 20 MB. No automatic retry (form consumed on send)."
 
 [[endpoints]]
 family = "library"
@@ -83,7 +83,7 @@ path = "/api/libraryfiles"
 request_content_type = ""
 response_status = 200
 permissions = ["Library.Manage"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "library"
@@ -93,7 +93,7 @@ path = "/api/libraryfiles/{file_name}"
 request_content_type = ""
 response_status = 204
 permissions = ["Library.Manage"]
-implemented = false
+implemented = true
 notes = "Returns 204 No Content on success"
 
 # ── Machine Actions ──────────────────────────────────────────────────
@@ -225,7 +225,8 @@ path = "/api/alerts"
 request_content_type = ""
 response_status = 200
 permissions = ["Alert.ReadWrite.All"]
-implemented = false
+implemented = true
+notes = "Supports OData $filter on severity, status, alertCreationTime, assignedTo, etc."
 
 [[endpoints]]
 family = "alerts"
@@ -235,7 +236,7 @@ path = "/api/alerts/{alert_id}"
 request_content_type = ""
 response_status = 200
 permissions = ["Alert.ReadWrite.All"]
-implemented = false
+implemented = true
 
 [[endpoints]]
 family = "alerts"
@@ -244,8 +245,8 @@ method = "PATCH"
 path = "/api/alerts/{alert_id}"
 request_content_type = "application/json"
 response_status = 200
-permissions = ["Alerts.ReadWrite.All"]
-implemented = false
+permissions = ["Alert.ReadWrite.All"]
+implemented = true
 notes = "Updatable fields: status, determination, classification, assignedTo, comment"
 
 [[endpoints]]
@@ -255,8 +256,9 @@ method = "PATCH"
 path = "/api/alerts/batchUpdate"
 request_content_type = "application/json"
 response_status = 200
-permissions = ["Alerts.ReadWrite.All"]
-implemented = false
+permissions = ["Alert.ReadWrite.All"]
+implemented = true
+notes = "Rate limit: 10 calls/min (stricter than standard 100/min)"
 
 # ── Indicators ───────────────────────────────────────────────────────
 

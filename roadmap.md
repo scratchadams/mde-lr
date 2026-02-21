@@ -2,7 +2,7 @@
 
 Status: Active  
 Owner: mde-lr maintainers  
-Last updated: 2026-02-16
+Last updated: 2026-02-20
 
 ## 1. Goal
 
@@ -25,19 +25,20 @@ These principles are aligned with `AGENTS.md`, `CLAUDE.md`, and
 
 ## 3. Current Baseline
 
-- Live Response coverage is implemented and tested:
-  - `GetFile`
-  - `RunScript`
-  - `PutFile`
-- Strong foundation already exists:
-  - OAuth2 token provider with caching/expiry buffer
-  - Authenticated client with one-shot 401 refresh retry
-  - Typed error model (`MdeError`) preserving API status/body
-  - Unit + integration tests with wiremock
-- Gaps before broad API expansion:
-  - Client surface lacks `PATCH`, `DELETE`, and multipart upload support.
-  - No standardized structured observability layer yet.
-  - Endpoint coverage tracking is manual today.
+Through Milestone 2, the following is implemented and tested (147 tests, 21/32 endpoints):
+
+- **Live Response** — GetFile, RunScript, PutFile (4-step async flow)
+- **Machines** — list (OData filter), get, update (tags/device value)
+- **Machine Actions** — isolate, unisolate, AV scan, collect investigation package, stop and quarantine file, restrict/unrestrict code execution
+- **Library** — list, upload (multipart), delete library files
+- **Alerts** — list (OData filter), get, update, batch-update security alerts
+- **Foundation** — OAuth2 token provider, authenticated client (401/429 retry), typed errors, PATCH/DELETE/multipart, endpoint manifest with CI validation
+- **CLI** — 21 action flags covering all implemented endpoints
+
+Remaining gaps:
+- No structured logging/tracing (`tracing` crate) — observability is print-based.
+- Results are fully buffered in memory before writing to disk.
+- Endpoint coverage at 66% (21/32 in manifest).
 
 ## 4. Target Architecture
 
@@ -54,62 +55,39 @@ These principles are aligned with `AGENTS.md`, `CLAUDE.md`, and
 
 ## 5. Delivery Plan
 
-## Milestone 0: Foundation for Expansion
+## Milestone 0: Foundation for Expansion (Complete)
 
-Deliverables:
+Deliverables (all done):
 
-- Introduce core HTTP capabilities needed for full API coverage:
-  - `PATCH`
-  - `DELETE`
-  - multipart/form-data upload
-  - explicit empty-response (`204`) handling
-- Add configurable retry policy primitives for non-auth failures
-  (starting with `429` handling).
-- Define endpoint manifest schema and create initial inventory file.
-- Establish codegen boundary (what is generated vs handwritten).
+- [x] PATCH, DELETE, multipart/form-data upload, 204 No Content handling
+- [x] Configurable retry policy (429 with `Retry-After` header)
+- [x] Endpoint manifest schema + CI validation
+- [x] Codegen boundary definition
 
-Exit criteria:
+## Milestone 1: Core Incident Response API Families (Complete)
 
-- New client methods are covered by unit and integration tests.
-- No regression in existing Live Response flow tests.
-- Manifest exists and is validated in CI.
-- Documentation explains generation and extension workflow.
+Deliverables (all done):
 
-## Milestone 1: Core Incident Response API Families
+- [x] Extracted shared action-polling abstraction (`action.rs` — `ActionStatus`, `MachineAction`, `PollConfig`, `poll_action()`)
+- [x] Machines family: `list_machines()` (OData filter), `get_machine()`, `update_machine()` with `Machine` struct (17 fields) and `ODataList<T>` generic wrapper
+- [x] Machine Actions family: 7 endpoints (isolate, unisolate, AV scan, collect investigation package, stop and quarantine file, restrict/unrestrict code execution) with shared `post_and_poll()` helper
+- [x] CLI integration: 9 new flags (`--isolate`, `--unisolate`, `--scan`, `--collect-investigation`, `--stop-quarantine`, `--restrict-execution`, `--unrestrict-execution`, `--get-machine`, `--list-machines`) plus `--comment`, `--isolation-type`, `--scan-type`, `--sha1`, `--filter`
+- [x] 24 new integration tests + 24 new unit tests (113 total)
+- [x] Manifest updated: 14/32 endpoints implemented
+- [x] Permission mapping documented per operation in module docs
 
-Deliverables:
+## Milestone 2: Library + Alert Workflows (Complete)
 
-- Add machine and machine-action families beyond live response:
-  - device lookup/list/get
-  - isolate/unisolate
-  - AV scan
-  - collect investigation package
-  - stop and quarantine file
-  - restrict/unrestrict code execution
-- Reuse shared action-polling abstractions where applicable.
-- Ensure permission mapping is documented per operation.
+Deliverables (all done):
 
-Exit criteria:
-
-- Public APIs for these families are documented and tested.
-- CLI can exercise representative operations end-to-end.
-- Errors include operation identifiers (for example action IDs) when available.
-
-## Milestone 2: Library + Alert Workflows
-
-Deliverables:
-
-- Script/library management family:
-  - list/upload/delete library files
-- Alert workflows:
-  - list/get/update alerts
-- Shared OData query helper for list endpoints.
-
-Exit criteria:
-
-- Multipart upload and delete paths are stable in integration tests.
-- Alert update semantics are validated with failure-path tests.
-- Documentation includes permission prerequisites and concrete examples.
+- [x] Library family: `list_library_files()`, `upload_library_file()` (multipart), `delete_library_file()` (204 No Content) with `LibraryFile` struct (8 fields)
+- [x] Alerts family: `list_alerts()` (OData filter), `get_alert()`, `update_alert()` (PATCH), `batch_update_alerts()` (PATCH, empty response) with `Alert` struct (~30 fields), `AlertComment`, `UpdateAlertRequest`, `BatchUpdateAlertsRequest`
+- [x] `patch_no_content()` client method for PATCH endpoints with JSON body but empty response
+- [x] CLI: 8 new action flags (`--list-library`, `--upload-library`, `--delete-library`, `--list-alerts`, `--get-alert`, `--update-alert`, `--batch-update-alerts`) + 7 supporting params (`--description`, `--alert-id`, `--alert-ids`, `--status`, `--classification`, `--determination`, `--assigned-to`)
+- [x] 12 new integration tests (5 library + 7 alerts) + 22 new unit tests (4 library + 9 alerts + 10 CLI parse - 1 conflict test)
+- [x] Manifest updated: 21/32 endpoints implemented (66%)
+- [x] Test coverage: 147 total (111 unit + 36 integration)
+- [x] Permission mapping documented per operation in module docs
 
 ## Milestone 3: Hunting + Indicators
 
@@ -181,8 +159,7 @@ All milestones must meet:
 
 ## 9. Immediate Next Actions
 
-1. Implement Milestone 0 client-surface upgrades (`PATCH`, `DELETE`,
-   multipart, `204` handling).
-2. Add endpoint manifest + CI validation scaffold.
-3. Audit and correct Live Response `PutFile` parameter contract against current
-   MDE docs to ensure API fidelity before broad rollout.
+1. Implement Milestone 3: Advanced hunting query support and indicator CRUD.
+2. Add JSON-first output path for automation consumers.
+3. Consider extracting shared OData query helper for list endpoints.
+4. Update manifest to track new endpoints as implemented.

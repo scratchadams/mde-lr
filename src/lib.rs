@@ -7,9 +7,11 @@
 //! # Modules
 //!
 //! - [`action`] — Shared machine-action types and polling abstraction.
+//! - [`alerts`] — Security alert listing, retrieval, and triage updates.
 //! - [`auth`] — OAuth2 client credentials token provider with expiry tracking.
 //! - [`client`] — Authenticated HTTP wrapper for the MDE REST API.
 //! - [`error`] — Typed error hierarchy (`MdeError`) for all library operations.
+//! - [`library`] — Live Response library file management (list, upload, delete).
 //! - [`live_response`] — Request/response types and end-to-end orchestration.
 //! - [`machine_actions`] — Remediation actions (isolate, scan, quarantine, etc.).
 //! - [`machines`] — Device lookup, listing, and property updates.
@@ -32,9 +34,11 @@
 #![warn(missing_docs)]
 
 pub mod action;
+pub mod alerts;
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod library;
 pub mod live_response;
 pub mod machine_actions;
 pub mod machines;

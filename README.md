@@ -1,17 +1,22 @@
 # mde-lr
 
-An async Rust CLI client for [Microsoft Defender for Endpoint (MDE)](https://learn.microsoft.com/en-us/defender-endpoint/) Live Response. Authenticates via Azure AD OAuth2 client credentials and orchestrates remote actions on managed devices — collecting files, executing scripts, and downloading results.
+An async Rust CLI client and library for [Microsoft Defender for Endpoint (MDE)](https://learn.microsoft.com/en-us/defender-endpoint/). Authenticates via Azure AD OAuth2 client credentials and orchestrates remote actions on managed devices — collecting files, executing scripts, downloading results, isolating machines, running AV scans, and more.
 
 ## What It Does
 
-MDE Live Response lets security teams interact with devices remotely through the MDE API. This tool wraps the full 4-step async flow into a single CLI invocation:
+`mde-lr` covers five MDE API families:
 
-1. **Start** — `POST /api/machines/{id}/runliveresponse` creates the action (returns `Pending`).
-2. **Poll** — `GET /api/machineactions/{id}` waits until the action reaches a terminal state (`Succeeded`, `Failed`, or `Cancelled`).
-3. **Link** — `GET .../GetLiveResponseResultDownloadLink(index=N)` retrieves a time-limited Azure Blob Storage SAS URL.
-4. **Download** — `GET {sas_url}` fetches the raw result bytes (no bearer auth; SAS token is in the query string).
+**Live Response** — Remote file collection, script execution, and file upload via the 4-step async flow (POST → poll → download link → SAS download).
 
-The CLI handles token acquisition, token refresh, bounded polling with timeout, one-shot 401 retry, and per-command result download automatically.
+**Machines** — Device lookup, listing (with OData filtering), and metadata updates (tags, device value).
+
+**Machine Actions** — Incident response operations: isolate/unisolate devices, run AV scans, collect investigation packages, stop and quarantine files, and restrict/unrestrict code execution.
+
+**Library** — Live Response library file management: list, upload (multipart), and delete scripts and tools.
+
+**Alerts** — Security alert triage: list (with OData filtering), get details, update individual alerts, and batch-update multiple alerts.
+
+The CLI handles token acquisition, token refresh, bounded polling with timeout, one-shot 401 retry, 429 throttle retry, and per-command result download automatically.
 
 ## Prerequisites
 
@@ -73,6 +78,101 @@ mde-lr \
 
 On success, the CLI prints the byte count of each result. On failure, it prints the error to stderr and exits with a non-zero code.
 
+### Machine Actions
+
+```bash
+# Isolate a device from the network
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --isolate --comment "Contain compromised host" --isolation-type Full
+
+# Release a device from isolation
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --unisolate --comment "Device cleared"
+
+# Run an antivirus scan
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --scan --comment "Routine check" --scan-type Quick
+
+# Collect an investigation package
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --collect-investigation --comment "Gather forensic artifacts"
+
+# Stop and quarantine a file by SHA-1
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --stop-quarantine --comment "Quarantine malware" --sha1 <SHA1_HASH>
+
+# Restrict code execution on a device
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --restrict-execution --comment "Lock down compromised device"
+
+# Unrestrict code execution
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --unrestrict-execution --comment "Device cleaned, lift restriction"
+```
+
+Machine actions are fire-and-forget by default — the CLI prints the action ID and initial status. Use the action ID in the MDE portal to track progress.
+
+### Library Management
+
+```bash
+# List all library files
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --list-library
+
+# Upload a script to the library
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --upload-library --file ./collector.ps1 --description "Forensic collector"
+
+# Delete a library file
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --delete-library --file "collector.ps1"
+```
+
+### Alert Workflows
+
+```bash
+# List all alerts
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --list-alerts
+
+# List alerts with OData filter
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --list-alerts --filter "severity eq 'High'"
+
+# Get a specific alert
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --get-alert --alert-id <ALERT_ID>
+
+# Update an alert (status, classification, assignment, comment)
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --update-alert --alert-id <ALERT_ID> \
+  --status Resolved --classification FalsePositive \
+  --determination NotMalicious --assigned-to "analyst@contoso.com" \
+  --comment "Confirmed false positive"
+
+# Batch update multiple alerts
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --batch-update-alerts --alert-ids "alert-1,alert-2,alert-3" \
+  --status Resolved --classification FalsePositive \
+  --comment "Batch close — false positives"
+```
+
+### Machine Queries
+
+```bash
+# Get details for a specific machine
+mde-lr --device-id <ID> --tenant-id <TID> --client-id <CID> --secret <S> \
+  --get-machine
+
+# List machines (all)
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --list-machines
+
+# List machines with OData filter
+mde-lr --tenant-id <TID> --client-id <CID> --secret <S> \
+  --list-machines --filter "healthStatus eq 'Active'"
+```
+
 ### Authentication via Environment Variable (Recommended)
 
 To avoid exposing the client secret in process listings and shell history, set it as an environment variable:
@@ -99,17 +199,46 @@ The `--secret` flag reads from `MDE_CLIENT_SECRET` automatically when not provid
 
 | Flag | Required | Description |
 |---|---|---|
-| `--device-id` | Yes | MDE device ID to target |
+| `--device-id` | Some actions | MDE device ID to target (not required for library, alert, `--list-machines`, or `-t` actions) |
 | `--tenant-id` | Yes | Azure AD tenant ID for OAuth2 |
 | `--client-id` | Yes | Azure AD application (client) ID |
 | `--secret` | Yes | Client secret (or set `MDE_CLIENT_SECRET` env var) |
-| `-g` | One of `-g`/`-r`/`-p` | GetFile action — collect a file from the remote device |
-| `-r` | One of `-g`/`-r`/`-p` | RunScript action — execute a PowerShell script on the device |
-| `-p` | One of `-g`/`-r`/`-p` | PutFile action — upload a file from the MDE library to the device |
-| `--file` | When using `-g` or `-p` | Remote file path to collect or upload |
-| `--script` | When using `-r` | Name of the script to execute (must exist in MDE library) |
-| `--args` | No | Arguments to pass to the script (supports hyphen-prefixed values) |
-| `--out` | No (recommended for `-g`) | Output file path for saving downloaded results to disk |
+| `-g` | One action | GetFile — collect a file from the remote device |
+| `-r` | One action | RunScript — execute a PowerShell script on the device |
+| `-p` | One action | PutFile — upload a file from the MDE library to the device |
+| `-t` | One action | Token inspection — acquire and print OAuth2 token |
+| `--isolate` | One action | Isolate a device from the network |
+| `--unisolate` | One action | Release a device from network isolation |
+| `--scan` | One action | Run a Microsoft Defender Antivirus scan |
+| `--collect-investigation` | One action | Collect a forensic investigation package |
+| `--stop-quarantine` | One action | Stop and quarantine a file by SHA-1 hash |
+| `--restrict-execution` | One action | Restrict application execution on a device |
+| `--unrestrict-execution` | One action | Remove app execution restrictions |
+| `--get-machine` | One action | Get details for a specific machine |
+| `--list-machines` | One action | List machines (with optional `--filter`) |
+| `--list-library` | One action | List all Live Response library files |
+| `--upload-library` | One action | Upload a file to the Live Response library |
+| `--delete-library` | One action | Delete a file from the Live Response library |
+| `--list-alerts` | One action | List security alerts (with optional `--filter`) |
+| `--get-alert` | One action | Get a specific alert by ID |
+| `--update-alert` | One action | Update an alert (status, classification, assignment, comment) |
+| `--batch-update-alerts` | One action | Batch-update multiple alerts at once |
+| `--file` | `-g`, `-p`, library | Remote file path to collect/upload, or library filename to delete |
+| `--script` | `-r` | Script name (must exist in MDE library) |
+| `--args` | No | Arguments for the script (supports hyphen-prefixed values) |
+| `--out` | No | Output file path for saving downloaded results to disk |
+| `--comment` | Machine actions | Audit comment (required for all machine action endpoints) |
+| `--isolation-type` | `--isolate` | Isolation type: `Full` (default), `Selective`, or `UnManagedDevice` |
+| `--scan-type` | `--scan` | Scan type: `Quick` (default) or `Full` |
+| `--sha1` | `--stop-quarantine` | SHA-1 hash of the file to quarantine |
+| `--filter` | `--list-machines`, `--list-alerts` | OData `$filter` expression for filtering results |
+| `--description` | `--upload-library` | Description for the uploaded library file |
+| `--alert-id` | `--get-alert`, `--update-alert` | Alert ID to retrieve or update |
+| `--alert-ids` | `--batch-update-alerts` | Comma-separated alert IDs for batch update |
+| `--status` | Alert updates | Alert status: `New`, `InProgress`, or `Resolved` |
+| `--classification` | Alert updates | Alert classification (e.g., `FalsePositive`, `TruePositive`) |
+| `--determination` | Alert updates | Alert determination (e.g., `NotMalicious`, `Malware`) |
+| `--assigned-to` | Alert updates | Email of the analyst to assign the alert to |
 
 ### Exit Codes
 
@@ -126,34 +255,60 @@ src/
   lib.rs              # Crate root — re-exports modules, #![warn(missing_docs)]
   main.rs             # CLI entry point (clap-derived args, exit codes)
   auth.rs             # OAuth2 TokenProvider — token acquisition, caching, expiry
-  client.rs           # MdeClient — authenticated HTTP wrapper with 401 retry
+  client.rs           # MdeClient — authenticated HTTP wrapper with 401/429 retry
   error.rs            # MdeError — typed error hierarchy (thiserror)
+  action.rs           # Shared action-polling abstraction (ActionStatus, MachineAction, PollConfig)
   live_response.rs    # Live Response models + 4-step orchestration
+  machines.rs         # Machines family — list, get, update machine endpoints
+  machine_actions.rs  # Machine Actions family — isolate, scan, quarantine, etc.
+  library.rs          # Library family — list, upload, delete library files
+  alerts.rs           # Alerts family — list, get, update, batch-update alerts
 tests/
-  live_response_flow.rs  # Integration tests using wiremock mock server
+  live_response_flow.rs    # Integration tests for live response flow
+  machines_flow.rs         # Integration tests for machines endpoints
+  machine_actions_flow.rs  # Integration tests for machine action endpoints
+  library_flow.rs          # Integration tests for library endpoints
+  alerts_flow.rs           # Integration tests for alert endpoints
+  manifest_validation.rs   # Endpoint manifest TOML validation
+manifest/
+  endpoints.toml           # MDE API endpoint inventory (21/32 implemented)
 ```
 
 ## Architecture
 
-The crate is organized into four modules with clear responsibilities:
+The crate is organized into nine modules with clear responsibilities:
 
 **`auth`** — Manages the OAuth2 client credentials flow against Azure AD's `/oauth2/v2.0/token` endpoint. Caches the token and tracks its expiry with a 60-second safety buffer. Callers never need to explicitly "log in" — the first API request triggers token acquisition automatically.
 
-**`client`** — Wraps `reqwest::Client` with bearer-token authentication and a one-shot 401 retry mechanism. If the MDE API returns `401 Unauthorized`, the client invalidates the cached token, acquires a fresh one from Azure AD, and retries exactly once. A second 401 is treated as a hard failure. The token is stored behind a `tokio::sync::Mutex` so `&self` methods can refresh it without requiring `&mut self`.
+**`client`** — Wraps `reqwest::Client` with bearer-token authentication, a one-shot 401 retry mechanism, and configurable 429 throttle retry with `Retry-After` header support. The token is stored behind a `tokio::sync::Mutex` so `&self` methods can refresh it without requiring `&mut self`. Supports GET, POST, PUT, PATCH, DELETE, and multipart upload.
 
-**`error`** — Typed error hierarchy (`MdeError`) with variants for each failure boundary: `Auth`, `Api` (preserves response body), `Timeout`, `ActionFailed`, `Parse`, and `Network`. Replaces the previous `Box<dyn Error>` convention with structured errors that enable callers to match on failure categories and inspect the full cause chain via `source()`.
+**`error`** — Typed error hierarchy (`MdeError`) with variants for each failure boundary: `Auth`, `Api` (preserves response body), `Timeout`, `ActionFailed`, `Throttled`, `Parse`, and `Network`.
 
-**`live_response`** — Contains the request/response types for the MDE Live Response API and the `run_live_response()` orchestration function. Polling is bounded by a configurable timeout (default 10 minutes) and interval (default 5 seconds). The `ActionStatus` enum uses `#[serde(other)]` for forward compatibility with new API status values.
+**`action`** — Shared polling abstraction used by all action-based endpoint families. Contains `ActionStatus`, `MachineAction`, `PollConfig`, and the `poll_action()` function. Extracted from `live_response` for reuse across machine actions.
+
+**`live_response`** — Request/response types for the MDE Live Response API and the `run_live_response()` 4-step orchestration function (POST → poll → download link → SAS download).
+
+**`machines`** — Machine lookup, listing with OData filtering, and metadata updates. Provides `Machine` struct, `ODataList<T>` generic collection wrapper, and `UpdateMachineRequest`.
+
+**`machine_actions`** — Seven incident response endpoints: isolate, unisolate, AV scan, collect investigation package, stop and quarantine file, restrict/unrestrict code execution. All follow a shared POST → optional-poll pattern via `post_and_poll()`.
+
+**`library`** — Live Response library file management. List files (OData collection), upload via multipart/form-data (no auto-retry since form is consumed on send), and delete (204 No Content).
+
+**`alerts`** — Security alert triage. List with OData filtering, get by ID, update individual alerts (PATCH), and batch-update multiple alerts. Evidence is stored as `serde_json::Value` (polymorphic, deferred typing).
 
 ```
-main.rs ──> MdeClient ──> TokenProvider
+main.rs ──> MdeClient ──────────> TokenProvider
    │            │
    │            └──> reqwest::Client
    │
-   └──> run_live_response() ──> MdeClient (via &self)
+   ├──> run_live_response()     ──> MdeClient + poll_action()
+   ├──> machines::*()           ──> MdeClient
+   ├──> machine_actions::*()    ──> MdeClient + poll_action()
+   ├──> library::*()            ──> MdeClient
+   └──> alerts::*()             ──> MdeClient
 ```
 
-`run_live_response` is a free function that borrows `&MdeClient`, not a method on it. This keeps the HTTP transport layer separate from orchestration logic.
+All endpoint functions are free functions that borrow `&MdeClient`, not methods on it. This keeps the HTTP transport layer separate from endpoint-specific logic.
 
 For a detailed architecture document covering state diagrams, failure semantics, sequence diagrams, design decisions, and configuration defaults, see [architecture.md](architecture.md).
 
@@ -229,6 +384,100 @@ async fn main() -> Result<(), MdeError> {
 }
 ```
 
+### Machine Actions
+
+```rust
+use mde_lr::action::PollConfig;
+use mde_lr::machine_actions::*;
+use mde_lr::machines;
+
+// Isolate a device (fire-and-forget)
+let action = isolate_machine(
+    &client, "device-id",
+    &IsolateRequest {
+        comment: "Contain compromised host".to_string(),
+        isolation_type: "Full".to_string(),
+    },
+    None, // No polling — returns immediately with Pending action
+).await?;
+println!("Action {} status: {:?}", action.id, action.status);
+
+// Isolate and wait for completion
+let action = isolate_machine(
+    &client, "device-id",
+    &IsolateRequest {
+        comment: "Contain compromised host".to_string(),
+        isolation_type: "Full".to_string(),
+    },
+    Some(&PollConfig::default()), // Poll until Succeeded/Failed/Cancelled
+).await?;
+
+// List machines with OData filter
+let machines = machines::list_machines(
+    &client, Some("healthStatus eq 'Active'"),
+).await?;
+for machine in &machines.value {
+    println!("{}: {}", machine.id, machine.computer_dns_name);
+}
+
+// Get a specific machine
+let machine = machines::get_machine(&client, "device-id").await?;
+println!("OS: {}, Health: {}", machine.os_platform, machine.health_status);
+```
+
+### Library and Alert Management
+
+```rust
+use mde_lr::library;
+use mde_lr::alerts::{self, UpdateAlertRequest, BatchUpdateAlertsRequest};
+
+// List library files
+let files = library::list_library_files(&client).await?;
+for f in &files {
+    println!("{}: {}", f.file_name, f.sha256.as_deref().unwrap_or("n/a"));
+}
+
+// Upload a script to the library
+let uploaded = library::upload_library_file(
+    &client,
+    "collector.ps1",
+    std::fs::read("collector.ps1")?,
+    Some("Forensic collector script"),
+    false, // override_if_exists
+).await?;
+
+// Delete a library file
+library::delete_library_file(&client, "old-script.ps1").await?;
+
+// List alerts with OData filter
+let alerts = alerts::list_alerts(&client, Some("severity eq 'High'")).await?;
+
+// Get a specific alert
+let alert = alerts::get_alert(&client, "alert-123").await?;
+println!("Alert: {} — {}", alert.id, alert.title.as_deref().unwrap_or(""));
+
+// Update an alert
+let update = UpdateAlertRequest {
+    status: Some("Resolved".to_string()),
+    classification: Some("FalsePositive".to_string()),
+    determination: Some("NotMalicious".to_string()),
+    assigned_to: Some("analyst@contoso.com".to_string()),
+    comment: Some("Confirmed false positive".to_string()),
+};
+let updated = alerts::update_alert(&client, "alert-123", &update).await?;
+
+// Batch update alerts
+let batch = BatchUpdateAlertsRequest {
+    alert_ids: vec!["alert-1".into(), "alert-2".into()],
+    status: Some("Resolved".to_string()),
+    classification: Some("FalsePositive".to_string()),
+    determination: Some("NotMalicious".to_string()),
+    assigned_to: None,
+    comment: Some("Batch close".to_string()),
+};
+alerts::batch_update_alerts(&client, &batch).await?;
+```
+
 ## Configuration Defaults
 
 | Setting | Value | Rationale |
@@ -263,7 +512,7 @@ async fn main() -> Result<(), MdeError> {
 # Build
 cargo build
 
-# Run all tests (60 unit + 10 integration)
+# Run all tests (111 unit + 36 integration = 147 total)
 cargo test
 
 # Run a specific test
@@ -278,13 +527,14 @@ cargo fmt
 
 ### How Tests Work
 
-Integration tests use [wiremock](https://crates.io/crates/wiremock) to mock both the MDE API and Azure Blob Storage in a single in-process HTTP server. This works because:
+Integration tests use [wiremock](https://crates.io/crates/wiremock) to mock the MDE API in a single in-process HTTP server. `MdeClient::with_base_url()` redirects all API calls to the mock server, and `TokenProvider::with_token()` bypasses Azure AD entirely. Six test suites cover:
 
-1. `MdeClient::with_base_url()` redirects API calls to the mock server.
-2. The mock for `GetLiveResponseResultDownloadLink` returns a SAS URL that also points at the mock server.
-3. `MdeClient::download()` uses the same `reqwest::Client`, so SAS downloads also hit the mock.
-
-All four steps of the live response flow execute without any real network calls. `TokenProvider::with_token()` bypasses Azure AD entirely by pre-setting a token.
+- **`live_response_flow.rs`** (7 tests) — Full 4-step flow, failure paths, polling progression
+- **`machines_flow.rs`** (7 tests) — List/get/update with OData filter, error handling
+- **`machine_actions_flow.rs`** (7 tests) — Isolate, scan, quarantine, restrict, API errors
+- **`library_flow.rs`** (5 tests) — List, upload (multipart), delete (204), delete 404, empty list
+- **`alerts_flow.rs`** (7 tests) — List with filter, get, update, batch update, error paths
+- **`manifest_validation.rs`** (3 tests) — TOML schema, implemented endpoints, HTTP verb validation
 
 ### Dependencies
 
@@ -340,11 +590,28 @@ The project follows a phased plan. Phases 1-4 are complete:
 - [x] `MdeError::Throttled` error variant
 - [x] Endpoint manifest (`manifest/endpoints.toml`) with CI schema/structural validation
 - [x] Codegen boundary definition in architecture docs
-- [x] Test coverage: 70 total (60 unit + 10 integration)
+
+**Milestone 1** (core incident response):
+- [x] Extracted shared action-polling abstraction (`action.rs`)
+- [x] Machines family — list (OData filter), get, update (3 endpoints)
+- [x] Machine Actions family — isolate, unisolate, AV scan, collect investigation, stop quarantine, restrict/unrestrict (7 endpoints)
+- [x] CLI integration for all new endpoints (9 new flags)
+- [x] 24 new integration tests + 24 new unit tests
+- [x] Manifest updated: 14/32 endpoints implemented
+- [x] Test coverage: 113 total (89 unit + 24 integration)
+
+**Milestone 2** (library + alert workflows):
+- [x] Library family — list, upload (multipart), delete (3 endpoints)
+- [x] Alerts family — list (OData filter), get, update, batch-update (4 endpoints)
+- [x] `patch_no_content()` client method for PATCH with empty response body
+- [x] CLI integration: 8 new action flags + 7 supporting params
+- [x] 12 new integration tests + 22 new unit tests
+- [x] Manifest updated: 21/32 endpoints implemented (66%)
+- [x] Test coverage: 147 total (111 unit + 36 integration)
 
 Planned next (see [roadmap.md](roadmap.md)):
 
-- [ ] Milestone 1: Core incident response API families (isolate, scan, investigation package)
+- [ ] Milestone 3: Hunting + indicators
 - [ ] Structured logging/tracing (`tracing` crate)
 - [ ] Streaming write-to-disk for large file downloads (currently buffered in memory)
 - [ ] Workspace split (separate library/CLI crates) when a second consumer emerges
